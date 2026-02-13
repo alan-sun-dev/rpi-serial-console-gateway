@@ -16,17 +16,20 @@ Multi-port exclusive console server for Raspberry Pi — remote access to Cisco/
 ┌──────────────▼───────────────────────────────────────────┐
 │  Raspberry Pi (console-gateway)                          │
 │                                                          │
-│  ┌─────────────────────┐    ┌──────────────────────┐     │
-│  │ socat bridge :2001  │───▶│ /dev/ttyUSB0 (9600)  │──┐  │
-│  │ flock exclusive     │    └──────────────────────┘  │  │
-│  └─────────────────────┘                              │  │
-│  ┌─────────────────────┐    ┌──────────────────────┐  │  │
-│  │ socat bridge :2002  │───▶│ /dev/ttyUSB1 (9600)  │──┤  │
-│  │ flock exclusive     │    └──────────────────────┘  │  │
-│  └─────────────────────┘                              │  │
-└───────────────────────────────────────────────────────┤──┘
-                                                        │
-               ┌────────────────────────────────────────┘
+│  ┌─────────────────────────┐  ┌──────────────────────┐   │
+│  │ socat bridge :2001      │─▶│ /dev/cgw-SW-CORE-01  │─┐ │
+│  │ flock exclusive         │  │ (-> /dev/ttyUSB0)    │ │ │
+│  └─────────────────────────┘  └──────────────────────┘ │ │
+│  ┌─────────────────────────┐  ┌──────────────────────┐ │ │
+│  │ socat bridge :2002      │─▶│ /dev/cgw-RTR-WAN-01  │─┤ │
+│  │ flock exclusive         │  │ (-> /dev/ttyUSB1)    │ │ │
+│  └─────────────────────────┘  └──────────────────────┘ │ │
+│                                                        │ │
+│  udev rules: persistent /dev/cgw-* symlinks            │ │
+│  map.tsv: symlink → port → baud → alias                │ │
+└────────────────────────────────────────────────────────┤─┘
+                                                         │
+               ┌─────────────────────────────────────────┘
                ▼
      ┌──────────────────┐   ┌──────────────────┐
      │ Cisco Switch      │   │ Cisco Router      │
@@ -37,10 +40,11 @@ Multi-port exclusive console server for Raspberry Pi — remote access to Cisco/
 ## Features
 
 - **Exclusive per-port locking** — `flock`-based; second user gets a `[busy]` message instead of garbled output
+- **Persistent device naming** — udev rules create stable `/dev/cgw-<alias>` symlinks based on USB adapter attributes (vendor/product/serial); survives reboot, re-plug, and port swaps
+- **Interactive setup wizard** — `consolectl addconsole` walks you through alias + baud + udev rule creation
 - **Multi-port support** — auto-detects all USB-serial adapters, assigns each a unique TCP port
 - **Tailscale VPN** — zero-config mesh networking, no port forwarding needed
 - **SSH hardened** — key-only auth, no root login, restricted to support user
-- **Device aliasing** — name ports like `SW-CORE-01` instead of `ttyUSB0`
 - **Session logging** — who connected, when, from where
 - **Hot-plug rescan** — `consolectl rescan` picks up newly plugged adapters
 - **Idle & max timeout** — auto-disconnect inactive or long-running sessions
@@ -62,34 +66,71 @@ sudo bash console-gateway-install.sh
 # 2. Add your SSH public key
 sudo nano /home/support/.ssh/authorized_keys
 
-# 3. Authenticate Tailscale
+# 3. Plug USB-serial adapters and add with persistent naming
+console-detect                      # see devices + USB attributes
+sudo consolectl addconsole          # interactive wizard per adapter
+
+# 4. Authenticate Tailscale
 sudo tailscale up
 tailscale ip -4   # note the IP
 
-# 4. Plug USB-serial adapters and verify
-console-detect
+# 5. Verify
 consolectl list
 ```
 
-## Remote Access (from your laptop)
+## Persistent Device Naming
+
+The biggest operational risk with USB-serial adapters is **device name drift** — `/dev/ttyUSB0` might become `/dev/ttyUSB1` after a reboot or re-plug. console-gateway solves this with udev rules.
+
+### How it works
+
+When you run `sudo consolectl addconsole`, the wizard:
+
+1. Reads the adapter's USB attributes (`idVendor`, `idProduct`, `serial`)
+2. Creates a udev rule in `/etc/udev/rules.d/90-console-gateway.rules`
+3. This produces a stable symlink like `/dev/cgw-SW-CORE-01` → `/dev/ttyUSB0`
+4. The map and bridge reference the symlink, not the kernel name
+
+```
+# Example udev rule (auto-generated)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+  ATTRS{serial}=="AB81ADGV", SYMLINK+="cgw-SW-CORE-01", TAG+="console-gateway"
+```
+
+### Adapter serial numbers
+
+For best results, use adapters with **unique serial numbers** (most FTDI-based adapters have them). The wizard will warn you if an adapter lacks a serial number — in that case, the rule matches by vendor/product ID only, which means all identical adapters share the same rule.
+
+```bash
+# Check your adapters
+console-detect
+
+# Example output:
+#   ttyUSB0      -> cgw-SW-CORE-01
+#     Manufacturer: FTDI
+#     Product:      FT232R USB UART
+#     Vendor ID:    0403
+#     Product ID:   6001
+#     Serial:       AB81ADGV
+#     Uniqueness:   ✓ Has serial number (ideal for udev rule)
+```
+
+## Remote Access
 
 ```bash
 # SSH tunnel to the Pi (port 2001 = first serial device)
 ssh -L 2001:localhost:2001 support@100.x.x.x
 
-# In another terminal, connect to the console
-consolectl connect 2001
-# or by device name
-consolectl connect ttyUSB0
-# or by alias
+# In another terminal, connect by alias, device, or port
 consolectl connect SW-CORE-01
+consolectl connect cgw-SW-CORE-01
+consolectl connect 2001
 ```
 
 Alternatively, use plain `telnet` or `socat` on the tunneled port:
 
 ```bash
 telnet localhost 2001
-# or
 socat - TCP:localhost:2001
 ```
 
@@ -120,20 +161,13 @@ sudo TAILSCALE_ONLY=1 PORT_BASE=3001 CONSOLE_BAUD_DEFAULT=115200 bash console-ga
 The device-to-port mapping lives in `/etc/console-gateway/map.tsv`:
 
 ```
-# dev        port    baud    alias
-ttyUSB0      2001    9600    SW-CORE-01
-ttyUSB1      2002    9600    RTR-WAN-01
-ttyACM0      2003    115200  FW-EDGE-01
+# device             port    baud    alias
+cgw-SW-CORE-01       2001    9600    SW-CORE-01
+cgw-RTR-WAN-01       2002    9600    RTR-WAN-01
+cgw-FW-EDGE-01       2003    115200  FW-EDGE-01
 ```
 
-After editing, apply changes:
-
-```bash
-sudo systemctl daemon-reload
-sudo consolectl rescan
-```
-
-Alias rules: alphanumeric characters, hyphens, and underscores only (max 64 characters).
+Devices prefixed with `cgw-` are managed symlinks (persistent). Devices like `ttyUSB0` are kernel names (may drift). Use `sudo consolectl addconsole` to upgrade kernel-name entries to persistent symlinks.
 
 ### Installer Flags
 
@@ -146,26 +180,81 @@ sudo bash console-gateway-install.sh --help
 
 ### consolectl
 
-The main CLI tool for day-to-day operations:
-
 ```bash
-consolectl list                        # show all ports, status, aliases
+# Day-to-day
+consolectl list                        # all ports, status, symlink targets
 consolectl connect <alias|dev|port>    # connect to a console
-consolectl owner ttyUSB0               # who currently holds the lock
+consolectl owner SW-CORE-01            # who currently holds the lock
 consolectl tail 100                    # last 100 session log entries
 consolectl status                      # SSH, Tailscale, bridge health
 
-sudo consolectl kick ttyUSB0           # force-disconnect active session
-sudo consolectl rescan                 # detect new devices, start bridges
+# Administration (requires sudo)
+sudo consolectl addconsole             # interactive: add adapter + persistent naming
+sudo consolectl rmconsole SW-CORE-01   # remove adapter, udev rule, bridge
+sudo consolectl kick SW-CORE-01        # force-disconnect active session
+sudo consolectl rescan                 # quick-add new devices (kernel names)
+```
+
+### addconsole Workflow
+
+```
+$ sudo consolectl addconsole
+
+=== Console Gateway - Add Console Adapter ===
+
+Scanning for serial devices...
+
+Available devices:
+
+  [1] ttyUSB0       FTDI FT232R USB UART  (S/N: AB81ADGV)
+  [2] ttyUSB1       Prolific PL2303       (S/N: none)
+
+Select device number [1-2]: 1
+
+Selected: /dev/ttyUSB0
+USB attributes:
+  Vendor:  0403 (FTDI)
+  Product: 6001 (FT232R USB UART)
+  Serial:  AB81ADGV
+
+Alias name (e.g. SW-CORE-01, RTR-WAN-01): SW-CORE-01
+Baud rate [9600]: 9600
+
+Assigned port: 2001
+
+┌─────────────────────────────────────────────┐
+│  Summary                                    │
+├─────────────────────────────────────────────┤
+│  Device:    ttyUSB0                         │
+│  Alias:     SW-CORE-01                      │
+│  Symlink:   /dev/cgw-SW-CORE-01             │
+│  Port:      2001                            │
+│  Baud:      9600                            │
+│  Vendor:    0403:6001                       │
+│  Serial:    AB81ADGV                        │
+└─────────────────────────────────────────────┘
+
+Apply these settings? (Y/n): y
+
+[1/4] Creating udev rule...
+  ✓ Symlink /dev/cgw-SW-CORE-01 -> /dev/ttyUSB0
+[2/4] Updating map...
+  ✓ Added to /etc/console-gateway/map.tsv
+[3/4] Creating systemd service...
+[4/4] Verifying...
+  ✓ Bridge running on port 2001
+
+✅ Done! Connect with:
+   consolectl connect SW-CORE-01
 ```
 
 ### Locking Behavior
 
-When a user connects to a port, `flock` acquires an exclusive lock on that device:
+When a user connects to a port, `flock` acquires an exclusive lock:
 
-- **First user** → gets the console, sees `[ok] Locked ttyUSB0 by 127.0.0.1`
-- **Second user** → immediately gets `[busy] Console is in use for ttyUSB0. Try later.`
-- **Kick** → `sudo consolectl kick ttyUSB0` restarts the bridge, releasing the lock
+- **First user** → gets the console, sees `[ok] Locked cgw-SW-CORE-01 by 127.0.0.1`
+- **Second user** → immediately gets `[busy] Console is in use for cgw-SW-CORE-01. Try later.`
+- **Kick** → `sudo consolectl kick SW-CORE-01` restarts the bridge, releasing the lock
 
 ### Tailscale-Only Mode
 
@@ -184,24 +273,48 @@ sudo ufw status verbose
 /usr/local/bin/
 ├── console-lock-bridge          # socat bridge launcher (per-device)
 ├── console-session-handler      # per-connection session logic (flock + serial)
-├── consolectl                   # CLI management tool
-├── console-detect               # list USB-serial devices
-├── console-healthcheck          # health check script
+├── consolectl                   # CLI management tool (list/connect/addconsole/...)
+├── console-detect               # list USB-serial devices with attributes
+├── console-healthcheck          # health check (delegates to consolectl status)
 ├── console                      # direct screen access (with conflict warning)
 └── console-gateway-uninstall    # clean removal
 
 /etc/console-gateway/
 └── map.tsv                      # device → port → baud → alias mapping
 
+/etc/udev/rules.d/
+└── 90-console-gateway.rules     # persistent USB-serial symlink rules
+
 /etc/systemd/system/
-├── console-lock-bridge@.service              # systemd template unit
-└── console-lock-bridge@ttyUSB0.service.d/
-    └── 10-env.conf                           # per-device environment override
+├── console-lock-bridge@.service                   # systemd template unit
+└── console-lock-bridge@cgw-SW-CORE-01.service.d/
+    └── 10-env.conf                                # per-device environment
 
 /var/log/
 ├── console-gateway-sessions.log  # session audit log (logrotated weekly)
 └── console-gateway-install.log   # installer log (logrotated monthly)
+
+/dev/
+├── cgw-SW-CORE-01 -> ttyUSB0    # persistent symlink (udev-managed)
+└── cgw-RTR-WAN-01 -> ttyUSB1    # persistent symlink (udev-managed)
 ```
+
+## Comparison with ConsolePi
+
+| Feature | console-gateway | ConsolePi |
+|---------|----------------|-----------|
+| Serial daemon | socat + flock | ser2net |
+| Exclusive locking | ✅ Built-in | ❌ Not supported |
+| Persistent naming | ✅ udev + cgw- symlinks | ✅ udev + custom symlinks |
+| Remote access | Tailscale + SSH tunnel | OpenVPN + Telnet/SSH |
+| Multi-Pi cluster | Single node | ✅ Google Drive / mDNS |
+| Power control | — | GPIO / espHome / Tasmota / DLI |
+| TUI menu | CLI only | ✅ curses-style menu |
+| ZTP orchestration | — | ✅ Built-in |
+| Install complexity | Single shell script | Python + many dependencies |
+| Code size | ~700 lines bash | ~15,000+ lines Python + bash |
+
+console-gateway is designed for teams that need a **simple, secure, conflict-free** console server with minimal dependencies. ConsolePi is a better fit if you need multi-Pi clustering, power outlet control, or a full TUI experience.
 
 ## Uninstall
 
@@ -209,33 +322,41 @@ sudo ufw status verbose
 sudo console-gateway-uninstall
 ```
 
-This removes all bridge services, systemd units, scripts, and config files. Tailscale and UFW rules are preserved.
+Removes all bridge services, systemd units, scripts, udev rules, and config files. Tailscale and UFW rules are preserved.
 
 ## Troubleshooting
 
 **No serial devices detected:**
 ```bash
-console-detect          # check USB devices
+console-detect          # check USB devices and attributes
 lsusb                   # verify adapter is recognized
 dmesg | tail -20        # check kernel messages
 ```
 
+**Symlink not appearing after addconsole:**
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=tty
+ls -la /dev/cgw-*
+```
+
 **Bridge not starting:**
 ```bash
-systemctl status console-lock-bridge@ttyUSB0
-journalctl -u console-lock-bridge@ttyUSB0 -f
+systemctl status console-lock-bridge@cgw-SW-CORE-01
+journalctl -u console-lock-bridge@cgw-SW-CORE-01 -f
+```
+
+**Device name drifted (ttyUSB0 became ttyUSB1):**
+```bash
+# This is exactly why persistent naming exists. Migrate:
+sudo consolectl addconsole    # re-add with udev rule
+# The cgw- symlink always points to the right device
 ```
 
 **Permission denied on serial device:**
 ```bash
-# Ensure support user is in dialout group
 groups support
 sudo usermod -aG dialout support
-```
-
-**Port already in use:**
-```bash
-ss -tlnp | grep 2001   # check what's using the port
 ```
 
 ## License
@@ -244,4 +365,4 @@ MIT
 
 ## Contributing
 
-Issues and pull requests welcome. For major changes, please open an issue first to discuss what you'd like to change.
+Issues and pull requests welcome. For major changes, please open an issue first to discuss.
