@@ -1,5 +1,51 @@
 # Changelog
 
+## v2.8 (2026-03-05)
+
+Merged findings from two independent code reviews.
+
+### Security
+
+- **BAUD injection guard** — `console-lock-bridge` and `console-session-handler` now
+  validate that `$BAUD` and `$PORT` are strictly numeric before passing to socat's
+  address spec. Previously, a malicious environment value like `9600,exec:'...'` could
+  exploit socat's address parser.
+- **systemd service sandboxing** — bridge services now run with `NoNewPrivileges=yes`,
+  `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, and
+  `RestrictAddressFamilies=AF_INET AF_UNIX`. Even though the listener is bound to
+  127.0.0.1, defense-in-depth applies.
+- **UFW reset is now opt-in** — previously defaulted to `--no-ufw-reset` to skip reset,
+  meaning the default was destructive. Flipped to safe-by-default: existing rules are
+  preserved unless `--ufw-reset` is explicitly passed.
+
+### Bug Fixes
+
+- **`rmconsole` awk uses exact `SYMLINK+="name"` match** — previously used
+  `index($0, sym)` which would match `cgw-SW1` when removing `cgw-SW10` (substring
+  collision). Now requires the full `SYMLINK+="cgw-SW1"` string to match.
+- **Session handler cleans up owner file on exit** — added `trap cleanup EXIT INT TERM`
+  to remove `/run/console-gateway.${BASE}.owner` when session ends. Previously the
+  owner file could persist after abnormal exit, showing stale session info.
+- **Tailscale repo detection supports Debian and Ubuntu** — `install_tailscale()` was
+  hardcoded to `debian/` repo path. Ubuntu codenames (e.g. `jammy`) don't exist under
+  that path. Now detects distro family from `/etc/os-release`.
+- **`ss` port check uses strict pattern** — `grep ":${port} "` could false-match
+  (port 200 matching `:2001 `). Now uses `ss -tlnp sport = :${port}` for exact match.
+- **`generate_mapping()` checks port conflicts at bootstrap** — initial auto-detect
+  used `PORT_BASE + i` without checking if ports were already bound. Now uses the
+  same `ss` check as `next_available_port()`.
+- **`rmconsole` map.tsv uses awk exact field match** — replaced `grep -v` (regex-based,
+  `-` has special meaning in character classes) with `awk -F'\t' '$1 != dev'` for
+  safe exact first-field comparison.
+- **Uninstall script removes itself** — previously left
+  `/usr/local/bin/console-gateway-uninstall` behind after uninstall.
+
+### Cleanup
+
+- Removed unused `net-tools` from package dependencies (already have `iproute2`).
+
+---
+
 ## v2.7 (2026-03-05)
 
 ### Security
