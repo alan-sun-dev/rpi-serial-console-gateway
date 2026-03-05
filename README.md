@@ -61,7 +61,7 @@ Multi-port exclusive console server for Raspberry Pi — remote access to Cisco/
 
 ```bash
 # 1. Install
-sudo bash console-gateway-v2.6-install.sh
+sudo bash console-gateway-v2.9-install.sh
 
 # 2. Add your SSH public key
 sudo nano /home/support/.ssh/authorized_keys
@@ -110,7 +110,7 @@ For best results, use adapters with **unique serial numbers** (most FTDI-based a
 
 Multi-port USB-serial adapters expose multiple ports that share the same vendor/product/serial attributes. The `addconsole` wizard automatically detects this and includes `ENV{ID_USB_INTERFACE_NUM}` in the udev rule to distinguish each port individually.
 
-> **Technical note:** v2.6 uses `ENV{ID_USB_*}` properties instead of `ATTRS{}` for udev rules. `ATTRS{}` can only match attributes from a single parent device in the sysfs tree — on multi-port adapters, `bInterfaceNumber` and `serial` reside at different parent levels, causing `ATTRS{}`-based rules to silently fail.
+> **Technical note:** v2.9 uses `ENV{ID_USB_*}` properties instead of `ATTRS{}` for udev rules. `ATTRS{}` can only match attributes from a single parent device in the sysfs tree — on multi-port adapters, `bInterfaceNumber` and `serial` reside at different parent levels, causing `ATTRS{}`-based rules to silently fail.
 
 ```bash
 # Check your adapters
@@ -185,8 +185,8 @@ Devices prefixed with `cgw-` are managed symlinks (persistent). Devices like `tt
 ### Installer Flags
 
 ```bash
-sudo bash console-gateway-v2.6-install.sh --no-ufw-reset   # preserve existing UFW rules
-sudo bash console-gateway-v2.6-install.sh --help
+sudo bash console-gateway-v2.9-install.sh --ufw-reset   # reset all UFW rules before configuring (destructive)
+sudo bash console-gateway-v2.9-install.sh --help
 ```
 
 ## Operations
@@ -325,7 +325,7 @@ sudo ufw status verbose
 | TUI menu | CLI only | ✅ curses-style menu |
 | ZTP orchestration | — | ✅ Built-in |
 | Install complexity | Single shell script | Python + many dependencies |
-| Code size | ~700 lines bash | ~15,000+ lines Python + bash |
+| Code size | ~1,300 lines bash | ~15,000+ lines Python + bash |
 
 console-gateway is designed for teams that need a **simple, secure, conflict-free** console server with minimal dependencies. ConsolePi is a better fit if you need multi-Pi clustering, power outlet control, or a full TUI experience.
 
