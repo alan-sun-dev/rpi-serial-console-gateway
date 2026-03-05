@@ -61,7 +61,7 @@ Multi-port exclusive console server for Raspberry Pi — remote access to Cisco/
 
 ```bash
 # 1. Install
-sudo bash console-gateway-install.sh
+sudo bash console-gateway-v2.6-install.sh
 
 # 2. Add your SSH public key
 sudo nano /home/support/.ssh/authorized_keys
@@ -92,26 +92,38 @@ When you run `sudo consolectl addconsole`, the wizard:
 4. The map and bridge reference the symlink, not the kernel name
 
 ```
-# Example udev rule (auto-generated)
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
-  ATTRS{serial}=="AB81ADGV", SYMLINK+="cgw-SW-CORE-01", TAG+="console-gateway"
+# Example udev rule (auto-generated) — single-port adapter
+SUBSYSTEM=="tty", ENV{ID_USB_VENDOR_ID}=="0403", ENV{ID_USB_MODEL_ID}=="6001", \
+  ENV{ID_USB_SERIAL_SHORT}=="AB81ADGV", SYMLINK+="cgw-SW-CORE-01", TAG+="console-gateway"
+
+# Example udev rule — multi-port adapter (e.g. FTDI FT4232H), per-port distinction
+SUBSYSTEM=="tty", ENV{ID_USB_VENDOR_ID}=="0403", ENV{ID_USB_MODEL_ID}=="6011", \
+  ENV{ID_USB_SERIAL_SHORT}=="FT6LBZ6", ENV{ID_USB_INTERFACE_NUM}=="00", \
+  SYMLINK+="cgw-PORT1", TAG+="console-gateway"
 ```
 
 ### Adapter serial numbers
 
 For best results, use adapters with **unique serial numbers** (most FTDI-based adapters have them). The wizard will warn you if an adapter lacks a serial number — in that case, the rule matches by vendor/product ID only, which means all identical adapters share the same rule.
 
+### Multi-port adapters (e.g. FTDI FT4232H)
+
+Multi-port USB-serial adapters expose multiple ports that share the same vendor/product/serial attributes. The `addconsole` wizard automatically detects this and includes `ENV{ID_USB_INTERFACE_NUM}` in the udev rule to distinguish each port individually.
+
+> **Technical note:** v2.6 uses `ENV{ID_USB_*}` properties instead of `ATTRS{}` for udev rules. `ATTRS{}` can only match attributes from a single parent device in the sysfs tree — on multi-port adapters, `bInterfaceNumber` and `serial` reside at different parent levels, causing `ATTRS{}`-based rules to silently fail.
+
 ```bash
 # Check your adapters
 console-detect
 
-# Example output:
-#   ttyUSB0      -> cgw-SW-CORE-01
+# Example output (multi-port FTDI FT4232H):
+#   ttyUSB0      -> cgw-PORT1
 #     Manufacturer: FTDI
-#     Product:      FT232R USB UART
+#     Product:      FT4232H Quad HS USB-UART/FIFO IC
 #     Vendor ID:    0403
-#     Product ID:   6001
-#     Serial:       AB81ADGV
+#     Product ID:   6011
+#     Serial:       FT6LBZ6
+#     Interface:    00
 #     Uniqueness:   ✓ Has serial number (ideal for udev rule)
 ```
 
@@ -143,6 +155,7 @@ Override defaults before running the installer:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SUPPORT_USER` | `support` | Linux user for SSH access |
+| `ADMIN_USER` | `$SUDO_USER` | Admin user to include in SSH AllowUsers (auto-detected) |
 | `ALLOW_SSH_PORT` | `22` | SSH port |
 | `TAILSCALE_ONLY` | `0` | Set to `1` to restrict SSH to Tailscale interface only |
 | `PORT_BASE` | `2001` | First TCP port for serial bridges |
@@ -172,8 +185,8 @@ Devices prefixed with `cgw-` are managed symlinks (persistent). Devices like `tt
 ### Installer Flags
 
 ```bash
-sudo bash console-gateway-install.sh --no-ufw-reset   # preserve existing UFW rules
-sudo bash console-gateway-install.sh --help
+sudo bash console-gateway-v2.6-install.sh --no-ufw-reset   # preserve existing UFW rules
+sudo bash console-gateway-v2.6-install.sh --help
 ```
 
 ## Operations
@@ -351,6 +364,16 @@ journalctl -u console-lock-bridge@cgw-SW-CORE-01 -f
 # This is exactly why persistent naming exists. Migrate:
 sudo consolectl addconsole    # re-add with udev rule
 # The cgw- symlink always points to the right device
+```
+
+**Multi-port adapter: all ports get the same symlink or symlinks don't appear:**
+```bash
+# Verify your udev rules use ENV{} (not ATTRS{}) and include ID_USB_INTERFACE_NUM:
+cat /etc/udev/rules.d/90-console-gateway.rules
+# Correct rule should look like:
+#   SUBSYSTEM=="tty", ENV{ID_USB_VENDOR_ID}=="0403", ENV{ID_USB_MODEL_ID}=="6011", \
+#     ENV{ID_USB_SERIAL_SHORT}=="FT6LBZ6", ENV{ID_USB_INTERFACE_NUM}=="00", ...
+# If rules use ATTRS{}, re-run addconsole with v2.6 to regenerate them.
 ```
 
 **Permission denied on serial device:**
