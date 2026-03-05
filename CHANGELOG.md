@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.7 (2026-03-05)
+
+### Security
+
+- **Tailscale install switched from `curl | sh` to official apt repo** — eliminates
+  supply-chain risk from DNS hijacking or CDN compromise when piping remote scripts
+  directly into a root shell.
+
+### Bug Fixes
+
+- **`CONSOLE_BAUD_DEFAULT` now validated at startup** — previously, an invalid value
+  (e.g. `export CONSOLE_BAUD_DEFAULT=99999`) would pass `validate_basic()` unchecked
+  and propagate into map.tsv and systemd drop-ins, only failing at socat connect time.
+- **Removed `local` misuse inside subshells** — `local` inside a `( ... )` subshell
+  is semantically meaningless (subshell is a separate process). Fixed in `do_rmconsole`.
+- **Removed dead code `map_locked_append()`** — defined but never called; `generate_mapping()`
+  wrote directly with `>>` without locking. Removed to avoid confusion.
+- **`next_available_port()` now checks OS-level port conflicts** — previously only
+  scanned map.tsv; now uses `ss -tlnp` to skip ports already bound by other services.
+- **Summary box truncates long alias names** — alias can be up to 60 chars but the box
+  column was 32 wide, causing `│` border misalignment. Now uses `%.32s` truncation.
+- **Removed unused `jq` from package install** — was listed in `apt-get install` but
+  never used anywhere in the codebase.
+- **systemd template uses `BindsTo=dev-%i.device`** — previously only had
+  `After=network.target` (which is irrelevant for serial bridges). Without device
+  binding, systemd would endlessly restart the bridge when the device was unplugged,
+  flooding the journal with restart logs.
+- **`addconsole` step labels corrected** — was `[1/4]`..`[4/4]` but the "migrate old
+  entry" step had no label, making step 3 appear to jump. Now correctly `[1/5]`..`[5/5]`.
+- **`rmconsole` udev rule removal uses `TAG+"console-gateway"` for matching** —
+  previously matched only on symlink name, which could misidentify lines if the
+  symlink name appeared in unrelated comments. Now requires both the TAG and
+  symlink name to match.
+
+---
+
 ## v2.6 (2026-03-05)
 
 ### Bug Fixes
