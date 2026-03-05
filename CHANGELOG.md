@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.10 (2026-03-05)
+
+### Bug Fixes
+
+- **`apt-get` uses `DEBIAN_FRONTEND=noninteractive`** — prevents interactive prompts
+  (e.g. from iptables-persistent or kernel updates) from blocking unattended installs.
+- **Logrotate session log permissions changed to `0644`** — was `0640 root root`,
+  which prevented the `support` user from running `consolectl tail` without sudo.
+- **`addconsole` uses `udevadm settle` instead of `sleep 1`** — `sleep 1` is fragile
+  on slow systems (e.g. RPi Zero). `udevadm settle --timeout=5` properly waits for
+  all udev events to finish processing before checking for the symlink.
+
+---
+
 ## v2.9 (2026-03-05)
 
 ### Bug Fixes
