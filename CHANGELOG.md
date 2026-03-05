@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.9 (2026-03-05)
+
+### Bug Fixes
+
+- **Removed redundant manual `cleanup()` call in session handler** — `trap EXIT`
+  already calls `cleanup()` when the process exits. The extra manual call after
+  `timeout ... socat` was harmless but redundant.
+- **`generate_mapping()` counter fix** — previously used `i = port - PORT_BASE + 1`
+  to track device count, which miscounts when ports are skipped due to conflicts
+  (e.g. port 2001 occupied → jump to 2002 → `i` becomes 2 instead of 1, causing
+  next device to start at PORT_BASE + 2 = 2003, leaving a gap). Now uses independent
+  `device_count` and `next_port` variables.
+
+---
+
 ## v2.8 (2026-03-05)
 
 Merged findings from two independent code reviews.
