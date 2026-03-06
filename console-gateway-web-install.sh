@@ -147,6 +147,7 @@ def get_port_status(device):
     except Exception:
         pass
 
+    # Check if someone holds the lock
     owner = None
     owner_file = f"/run/console-gateway.{device}.owner"
     if os.path.isfile(owner_file):
@@ -158,6 +159,7 @@ def get_port_status(device):
         except Exception:
             pass
 
+    # Check symlink target
     link_target = None
     dev_path = f"/dev/{device}"
     if os.path.islink(dev_path):
@@ -271,8 +273,10 @@ def api_kick_port(device):
 def api_unlock_port(device):
     if not re.match(r'^[a-zA-Z0-9_-]+$', device):
         return jsonify({"error": "invalid device name"}), 400
+    # Remove the lock and owner files, then kill any socat session holding the device
     lock_file = f"/run/console-gateway.{device}.lock"
     owner_file = f"/run/console-gateway.{device}.owner"
+    # Find and kill the session handler holding this device
     rc, out, _ = run_cmd([
         "bash", "-c",
         f"fuser /dev/{device} 2>/dev/null | xargs -r kill 2>/dev/null; "
@@ -303,6 +307,7 @@ def api_rename_port(device):
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,59}$', new_alias):
         return jsonify({"error": "Invalid alias. Use letters, digits, hyphens, underscores (1-60 chars)."}), 400
 
+    # Update alias column in map.tsv only
     lines = []
     found = False
     if not os.path.isfile(MAP_FILE):
@@ -347,9 +352,11 @@ def api_start_port(device):
 @login_required
 def api_status():
     hostname = socket.gethostname()
+    # SSH
     rc_ssh, _, _ = run_cmd(["systemctl", "is-active", "--quiet", "ssh"])
     if rc_ssh != 0:
         rc_ssh, _, _ = run_cmd(["systemctl", "is-active", "--quiet", "sshd"])
+    # Tailscale
     rc_ts, ts_out, _ = run_cmd(["tailscale", "status", "--json"])
     tailscale_ip = None
     if rc_ts == 0:
@@ -386,12 +393,218 @@ def api_detect():
     return jsonify({"output": out if rc == 0 else err})
 
 
+# --------------- Settings API ---------------
+DROPIN_DIR = "/etc/systemd/system"
+WEB_SERVICE = "console-gateway-web"
+
+def read_port_settings(device):
+    """Read per-port settings from systemd drop-in."""
+    conf = f"{DROPIN_DIR}/console-lock-bridge@{device}.service.d/10-env.conf"
+    settings = {}
+    if os.path.isfile(conf):
+        with open(conf) as f:
+            for line in f:
+                m = re.match(r'^Environment=(\w+)=(.+)$', line.strip())
+                if m:
+                    settings[m.group(1)] = m.group(2)
+    return settings
+
+
+@app.route("/api/settings/ports")
+@login_required
+def api_settings_ports():
+    """Get all port settings."""
+    ports = read_map()
+    result = []
+    for p in ports:
+        s = read_port_settings(p["device"])
+        result.append({
+            "device": p["device"],
+            "alias": p.get("alias", ""),
+            "port": p["port"],
+            "baud": int(s.get("CONSOLE_BAUD", p["baud"])),
+            "idle_timeout": int(s.get("IDLE_TIMEOUT_SECONDS", 900)),
+            "max_session": int(s.get("MAX_SESSION_SECONDS", 3600)),
+        })
+    return jsonify(result)
+
+
+@app.route("/api/settings/ports/<device>", methods=["POST"])
+@login_required
+def api_settings_port_update(device):
+    """Update per-port settings."""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', device):
+        return jsonify({"error": "invalid device name"}), 400
+
+    data = request.get_json() or {}
+    baud = data.get("baud")
+    idle_timeout = data.get("idle_timeout")
+    max_session = data.get("max_session")
+
+    # Validate
+    valid_bauds = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
+    if baud is not None and int(baud) not in valid_bauds:
+        return jsonify({"error": f"Invalid baud rate. Valid: {valid_bauds}"}), 400
+    if idle_timeout is not None and (int(idle_timeout) < 30 or int(idle_timeout) > 86400):
+        return jsonify({"error": "Idle timeout must be 30-86400 seconds"}), 400
+    if max_session is not None and (int(max_session) < 60 or int(max_session) > 604800):
+        return jsonify({"error": "Max session must be 60-604800 seconds"}), 400
+
+    # Read current settings
+    current = read_port_settings(device)
+    if not current:
+        return jsonify({"error": f"No settings found for {device}"}), 404
+
+    # Update values
+    if baud is not None:
+        current["CONSOLE_BAUD"] = str(int(baud))
+    if idle_timeout is not None:
+        current["IDLE_TIMEOUT_SECONDS"] = str(int(idle_timeout))
+    if max_session is not None:
+        current["MAX_SESSION_SECONDS"] = str(int(max_session))
+
+    # Also update baud in map.tsv
+    if baud is not None:
+        map_lines = []
+        if os.path.isfile(MAP_FILE):
+            with open(MAP_FILE) as f:
+                for line in f:
+                    raw = line.rstrip("\n")
+                    if raw.startswith("#") or not raw.strip():
+                        map_lines.append(raw)
+                        continue
+                    parts = raw.split("\t")
+                    if len(parts) >= 3 and parts[0] == device:
+                        parts[2] = str(int(baud))
+                        map_lines.append("\t".join(parts))
+                    else:
+                        map_lines.append(raw)
+            with open(MAP_FILE, "w") as f:
+                f.write("\n".join(map_lines) + "\n")
+
+    # Write drop-in
+    conf_dir = f"{DROPIN_DIR}/console-lock-bridge@{device}.service.d"
+    conf_file = f"{conf_dir}/10-env.conf"
+    content = "[Service]\n"
+    for k, v in current.items():
+        content += f"Environment={k}={v}\n"
+
+    rc, _, err = run_cmd(["sudo", "bash", "-c",
+        f"mkdir -p '{conf_dir}' && cat > '{conf_file}' << 'CONFEOF'\n{content}CONFEOF"])
+    if rc != 0:
+        return jsonify({"error": f"Failed to write config: {err}"}), 500
+
+    # Reload and restart
+    run_cmd(["sudo", "systemctl", "daemon-reload"])
+    run_cmd(["sudo", "systemctl", "restart", f"console-lock-bridge@{device}.service"])
+
+    return jsonify({"ok": True, "message": f"Settings updated for {device}"})
+
+
+@app.route("/api/settings/global")
+@login_required
+def api_settings_global():
+    """Get global settings."""
+    # Read from the systemd template defaults
+    template = f"{DROPIN_DIR}/console-lock-bridge@.service"
+    defaults = {}
+    if os.path.isfile(template):
+        with open(template) as f:
+            for line in f:
+                m = re.match(r'^Environment=(\w+)=(.+)$', line.strip())
+                if m:
+                    defaults[m.group(1)] = m.group(2)
+
+    # Web service settings
+    web_conf = f"{DROPIN_DIR}/{WEB_SERVICE}.service"
+    web_settings = {}
+    if os.path.isfile(web_conf):
+        with open(web_conf) as f:
+            for line in f:
+                m = re.match(r'^Environment=(\w+)=(.+)$', line.strip())
+                if m:
+                    web_settings[m.group(1)] = m.group(2)
+
+    # SSH config
+    ssh_port = "22"
+    ssh_conf = "/etc/ssh/sshd_config.d/90-console-gateway.conf"
+    allow_users = ""
+    if os.path.isfile(ssh_conf):
+        with open(ssh_conf) as f:
+            for line in f:
+                if line.strip().startswith("AllowUsers"):
+                    allow_users = line.strip().split(None, 1)[1] if len(line.strip().split(None, 1)) > 1 else ""
+
+    return jsonify({
+        "console": {
+            "port_base": int(defaults.get("LOCAL_CONSOLE_PORT", 2001)),
+            "default_baud": int(defaults.get("CONSOLE_BAUD", 9600)),
+            "idle_timeout": int(defaults.get("IDLE_TIMEOUT_SECONDS", 900)),
+            "max_session": int(defaults.get("MAX_SESSION_SECONDS", 3600)),
+        },
+        "web": {
+            "host": web_settings.get("CGW_HOST", "0.0.0.0"),
+            "port": int(web_settings.get("CGW_PORT", 8080)),
+            "admin_user": web_settings.get("CGW_ADMIN_USER", "admin"),
+        },
+        "ssh": {
+            "allow_users": allow_users,
+        },
+    })
+
+
+@app.route("/api/settings/global", methods=["POST"])
+@login_required
+def api_settings_global_update():
+    """Update global defaults in the systemd template."""
+    data = request.get_json() or {}
+
+    valid_bauds = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
+    baud = data.get("default_baud")
+    idle = data.get("idle_timeout")
+    maxs = data.get("max_session")
+
+    if baud is not None and int(baud) not in valid_bauds:
+        return jsonify({"error": f"Invalid baud rate"}), 400
+    if idle is not None and (int(idle) < 30 or int(idle) > 86400):
+        return jsonify({"error": "Idle timeout must be 30-86400"}), 400
+    if maxs is not None and (int(maxs) < 60 or int(maxs) > 604800):
+        return jsonify({"error": "Max session must be 60-604800"}), 400
+
+    # Update the template service file
+    template = f"{DROPIN_DIR}/console-lock-bridge@.service"
+    if not os.path.isfile(template):
+        return jsonify({"error": "Template service not found"}), 404
+
+    with open(template) as f:
+        content = f.read()
+
+    if baud is not None:
+        content = re.sub(r'Environment=CONSOLE_BAUD=\d+',
+                         f'Environment=CONSOLE_BAUD={int(baud)}', content)
+    if idle is not None:
+        content = re.sub(r'Environment=IDLE_TIMEOUT_SECONDS=\d+',
+                         f'Environment=IDLE_TIMEOUT_SECONDS={int(idle)}', content)
+    if maxs is not None:
+        content = re.sub(r'Environment=MAX_SESSION_SECONDS=\d+',
+                         f'Environment=MAX_SESSION_SECONDS={int(maxs)}', content)
+
+    rc, _, err = run_cmd(["sudo", "bash", "-c",
+        f"cat > '{template}' << 'CONFEOF'\n{content}CONFEOF"])
+    if rc != 0:
+        return jsonify({"error": f"Failed: {err}"}), 500
+
+    run_cmd(["sudo", "systemctl", "daemon-reload"])
+    return jsonify({"ok": True, "message": "Global defaults updated. New ports will use these values."})
+
+
 # --------------- Tailscale API ---------------
 @app.route("/api/tailscale/status")
 @login_required
 def api_tailscale_status():
     rc, out, err = run_cmd(["tailscale", "status", "--json"], timeout=10)
     if rc != 0:
+        # Check if tailscaled is running at all
         rc2, _, _ = run_cmd(["systemctl", "is-active", "--quiet", "tailscaled"])
         return jsonify({
             "state": "stopped" if rc2 != 0 else "needs_login",
@@ -438,6 +651,7 @@ def api_tailscale_status():
 def api_tailscale_up():
     rc, out, err = run_cmd(["sudo", "tailscale", "up"], timeout=15)
     combined = (out + err).strip()
+    # Check if it needs browser auth
     login_url = None
     for line in combined.split("\n"):
         line = line.strip()
@@ -490,6 +704,7 @@ def open_terminal(data):
     port = int(port)
     sid = request.sid
 
+    # Close existing session if any
     if sid in terminal_sessions:
         try:
             terminal_sessions[sid].close()
@@ -581,19 +796,70 @@ cat > "${INSTALL_DIR}/templates/login.html" <<'LOGINEOF'
   <title>Console Gateway - Login</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
-    body { background: #0f1923; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-    .login-card { background: #1b2838; border: 1px solid #2a475e; border-radius: 12px; padding: 2rem; width: 380px; }
-    .login-card h4 { color: #66c0f4; }
-    .form-control { background: #0f1923; border-color: #2a475e; color: #f5f5f5; }
-    .form-control:focus { background: #0f1923; color: #f5f5f5; border-color: #66c0f4; box-shadow: 0 0 0 .2rem rgba(102,192,244,.25); }
-    .btn-primary { background: #66c0f4; border-color: #66c0f4; color: #0f1923; font-weight: 600; }
-    .btn-primary:hover { background: #4da8da; border-color: #4da8da; color: #0f1923; }
-    label { color: #b8bcbf; }
+    body {
+      background: linear-gradient(135deg, #1C0B2E 0%, #2A1148 50%, #1C0B2E 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    }
+    .login-card {
+      background: rgba(77, 20, 140, 0.15);
+      border: 1px solid rgba(77, 20, 140, 0.4);
+      border-radius: 12px;
+      padding: 2.5rem;
+      width: 400px;
+      backdrop-filter: blur(10px);
+    }
+    .login-card h4 {
+      color: #FFFFFF;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .login-card .brand-accent {
+      display: block;
+      width: 60px;
+      height: 4px;
+      background: linear-gradient(90deg, #4D148C, #7D22C3, #FF6200);
+      border-radius: 2px;
+      margin: 0 auto 1.5rem;
+    }
+    .form-control {
+      background: rgba(28, 11, 46, 0.8);
+      border-color: rgba(77, 20, 140, 0.5);
+      color: #FFFFFF;
+      border-radius: 8px;
+      padding: .6rem .9rem;
+    }
+    .form-control:focus {
+      background: rgba(28, 11, 46, 0.9);
+      color: #FFFFFF;
+      border-color: #007AB7;
+      box-shadow: 0 0 0 .2rem rgba(0, 122, 183, .25);
+    }
+    .btn-primary {
+      background: #4D148C;
+      border-color: #4D148C;
+      color: #FFFFFF;
+      font-weight: 600;
+      border-radius: 8px;
+      padding: .6rem;
+      transition: all 0.2s;
+    }
+    .btn-primary:hover {
+      background: #7D22C3;
+      border-color: #7D22C3;
+      color: #FFFFFF;
+    }
+    label { color: #B0A0C0; font-size: 0.9rem; }
+    .alert-danger { background: rgba(222, 0, 46, 0.15); border-color: #DE002E; color: #ff6b85; }
   </style>
 </head>
 <body>
   <div class="login-card">
-    <h4 class="text-center mb-4">Console Gateway</h4>
+    <h4 class="text-center mb-2">Console Gateway</h4>
+    <span class="brand-accent"></span>
     {% if error %}
     <div class="alert alert-danger py-2">{{ error }}</div>
     {% endif %}
@@ -625,62 +891,150 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
   <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" rel="stylesheet">
   <style>
-    :root { --bg-dark: #0f1923; --bg-card: #1b2838; --border: #2a475e; --accent: #66c0f4; --text: #f5f5f5; --text-muted: #b8bcbf; --text-label: #8f98a0; }
-    body { background: var(--bg-dark); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; }
-    .navbar { background: #171d25 !important; border-bottom: 1px solid var(--border); }
-    .navbar-brand { color: var(--accent) !important; font-weight: 700; }
+    :root {
+      /* Brand Colors */
+      --brand-primary: #4D148C;
+      --brand-accent: #FF6200;
+      --brand-blue: #007AB7;
+      --brand-cyan: #0CC0DF;
+      --brand-green: #008A00;
+      --brand-red: #DE002E;
+      --brand-yellow: #F7B118;
+      --brand-highlight: #7D22C3;
+      --brand-tint: #825BAF;
+      /* UI Theme (dark purple) */
+      --bg-dark: #1C0B2E;
+      --bg-card: #2A1148;
+      --border: rgba(77, 20, 140, 0.45);
+      --border-strong: #4D148C;
+      --accent: #FF6200;
+      --text: #FFFFFF;
+      --text-muted: #B0A0C0;
+      --text-label: #9080A8;
+    }
+    body { background: var(--bg-dark); color: var(--text); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+    .navbar { background: linear-gradient(90deg, #2A0E4A, #4D148C) !important; border-bottom: 2px solid var(--brand-accent); }
+    .navbar-brand { color: #FFFFFF !important; font-weight: 700; letter-spacing: -0.02em; }
+    .navbar-brand i { color: var(--brand-accent); }
     .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; }
-    .card-header { background: rgba(42,71,94,.4); border-bottom: 1px solid var(--border); font-weight: 600; color: #fff; }
+    .card-header { background: rgba(77, 20, 140, 0.3); border-bottom: 1px solid var(--border); font-weight: 600; color: #fff; }
     .table { color: var(--text); --bs-table-bg: transparent; }
-    .table thead th { border-color: var(--border); color: var(--text-label); font-size: .85rem; text-transform: uppercase; }
-    .table td { border-color: var(--border); vertical-align: middle; color: #ddd; }
-    .table code { color: var(--accent); background: rgba(102,192,244,.1); padding: 2px 6px; border-radius: 4px; }
-    .badge-running { background: #4caf50; color: #fff; }
-    .badge-stopped { background: #78909c; color: #fff; }
-    .badge-busy { background: #ff9800; color: #000; }
-    .badge-no-device { background: #ef5350; color: #fff; }
+    .table thead th { border-color: var(--border); color: var(--text-label); font-size: .85rem; text-transform: uppercase; letter-spacing: 0.03em; }
+    .table td { border-color: var(--border); vertical-align: middle; color: #E0D8EC; }
+    .table code { color: var(--brand-cyan); background: rgba(12, 192, 223, .1); padding: 2px 6px; border-radius: 4px; }
+
+    .badge-running { background: var(--brand-green); color: #fff; }
+    .badge-stopped { background: #565656; color: #fff; }
+    .badge-busy { background: var(--brand-yellow); color: #1C0B2E; }
+    .badge-no-device { background: var(--brand-red); color: #fff; }
+
     .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-    .status-dot.ok { background: #4caf50; }
-    .status-dot.down { background: #ef5350; }
+    .status-dot.ok { background: var(--brand-green); }
+    .status-dot.down { background: var(--brand-red); }
+
     .text-muted { color: var(--text-muted) !important; }
+
     .btn-sm { font-size: .8rem; }
-    .btn-outline-light { border-color: var(--border); color: var(--text-muted); }
-    .btn-outline-light:hover { background: var(--border); color: #fff; }
-    .btn-outline-danger { border-color: #ef5350; color: #ef5350; }
-    .btn-outline-danger:hover { background: #ef5350; color: #fff; }
-    #terminal-container { height: 420px; background: #000; border-radius: 6px; overflow: hidden; }
-    #session-log { max-height: 300px; overflow-y: auto; background: #111a24; border-radius: 6px; padding: 12px; font-family: monospace; font-size: .85rem; color: #c5c8ca; }
+    .btn-primary { background: var(--brand-primary); border-color: var(--brand-primary); color: #fff; }
+    .btn-primary:hover { background: var(--brand-highlight); border-color: var(--brand-highlight); color: #fff; }
+    .btn-outline-light { border-color: var(--border-strong); color: var(--text-muted); }
+    .btn-outline-light:hover { background: rgba(77, 20, 140, 0.5); color: #fff; border-color: var(--brand-highlight); }
+    .btn-outline-danger { border-color: var(--brand-red); color: #ff6b85; }
+    .btn-outline-danger:hover { background: var(--brand-red); color: #fff; }
+
+    /* Terminal */
+    #terminal-panel { display: none; }
+    #terminal-panel.active { display: block; }
+    #terminal-container { height: 420px; background: #0a0516; border-radius: 6px; overflow: hidden; }
+    .terminal-header { background: #1a0a30; padding: 8px 16px; border-radius: 6px 6px 0 0; display: flex; justify-content: space-between; align-items: center; }
+    .terminal-header .title { color: var(--brand-green); font-family: monospace; }
+
+    /* Session log */
+    #session-log { max-height: 300px; overflow-y: auto; background: rgba(28, 11, 46, 0.8); border-radius: 6px; padding: 12px; font-family: monospace; font-size: .85rem; color: #d0c8e0; }
     #session-log .line { padding: 2px 0; }
+
+    /* Tabs */
     .nav-tabs { border-color: var(--border); }
-    .nav-tabs .nav-link { color: var(--text-muted); border: none; }
-    .nav-tabs .nav-link.active { background: var(--bg-card); color: var(--accent); border-bottom: 2px solid var(--accent); }
+    .nav-tabs .nav-link { color: var(--text-muted); border: none; transition: color 0.2s; }
+    .nav-tabs .nav-link.active { background: var(--bg-card); color: var(--brand-accent); border-bottom: 2px solid var(--brand-accent); }
     .nav-tabs .nav-link:hover { color: #fff; }
+
     .info-value { font-size: 1.1rem; font-weight: 600; color: #fff; }
+
+    /* Status cards */
     .card .small { color: var(--text-label); }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg-dark); }
+    ::-webkit-scrollbar-thumb { background: var(--brand-primary); border-radius: 3px; }
+
+    /* Toast */
+    .toast { border: 1px solid var(--border-strong) !important; }
+
+    /* Forms in dark theme */
+    .form-select, .form-control { transition: border-color 0.2s; }
+    .form-select:focus, .form-control:focus { border-color: var(--brand-blue) !important; box-shadow: 0 0 0 .2rem rgba(0, 122, 183, .25); }
   </style>
 </head>
 <body>
   <nav class="navbar navbar-dark px-3">
-    <span class="navbar-brand"><i class="bi bi-hdd-rack"></i> Console Gateway</span>
+    <span class="navbar-brand"><i class="bi bi-hdd-rack"></i> Console Gateway <span style="font-size:.65em;font-weight:400;color:var(--brand-tint);vertical-align:middle;">v2.9</span></span>
     <div class="d-flex align-items-center gap-3">
       <span class="text-muted small" id="sys-time"></span>
       <span class="text-muted small" id="sys-host"></span>
       <a href="/logout" class="btn btn-sm btn-outline-light"><i class="bi bi-box-arrow-right"></i> Logout</a>
     </div>
   </nav>
+
   <div class="container-fluid p-3">
+    <!-- Status Bar -->
     <div class="row mb-3">
-      <div class="col-md-3"><div class="card p-3"><div class="text-muted small">Ports</div><div class="info-value" id="stat-total">-</div></div></div>
-      <div class="col-md-3"><div class="card p-3"><div class="text-muted small">Running</div><div class="info-value text-success" id="stat-running">-</div></div></div>
-      <div class="col-md-3"><div class="card p-3"><div class="text-muted small">SSH</div><div class="info-value" id="stat-ssh">-</div></div></div>
-      <div class="col-md-3"><div class="card p-3"><div class="text-muted small">Tailscale</div><div class="info-value" id="stat-tailscale">-</div></div></div>
+      <div class="col-md-3">
+        <div class="card p-3">
+          <div class="text-muted small">Ports</div>
+          <div class="info-value" id="stat-total">-</div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="card p-3">
+          <div class="text-muted small">Running</div>
+          <div class="info-value text-success" id="stat-running">-</div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="card p-3">
+          <div class="text-muted small">SSH</div>
+          <div class="info-value" id="stat-ssh">-</div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="card p-3">
+          <div class="text-muted small">Tailscale</div>
+          <div class="info-value" id="stat-tailscale">-</div>
+        </div>
+      </div>
     </div>
+
+    <!-- Tabs -->
     <ul class="nav nav-tabs mb-3" id="mainTabs">
-      <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#tab-ports"><i class="bi bi-list-ul"></i> Ports</a></li>
-      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tab-terminal"><i class="bi bi-terminal"></i> Terminal</a></li>
-      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tab-tailscale"><i class="bi bi-globe2"></i> Tailscale</a></li>
-      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tab-logs"><i class="bi bi-journal-text"></i> Session Log</a></li>
+      <li class="nav-item">
+        <a class="nav-link active" data-bs-toggle="tab" href="#tab-ports"><i class="bi bi-list-ul"></i> Ports</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link" data-bs-toggle="tab" href="#tab-terminal"><i class="bi bi-terminal"></i> Terminal</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link" data-bs-toggle="tab" href="#tab-tailscale"><i class="bi bi-globe2"></i> Tailscale</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link" data-bs-toggle="tab" href="#tab-logs"><i class="bi bi-journal-text"></i> Session Log</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link" data-bs-toggle="tab" href="#tab-settings"><i class="bi bi-gear"></i> Settings</a>
+      </li>
     </ul>
+
     <div class="tab-content">
       <!-- Ports Tab -->
       <div class="tab-pane fade show active" id="tab-ports">
@@ -691,34 +1045,54 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
           </div>
           <div class="card-body p-0">
             <table class="table table-hover mb-0">
-              <thead><tr><th>Device</th><th>Port</th><th>Baud</th><th>Alias</th><th>Status</th><th>Link</th><th>Owner</th><th>Actions</th></tr></thead>
+              <thead>
+                <tr>
+                  <th>Device</th>
+                  <th>Port</th>
+                  <th>Baud</th>
+                  <th>Alias</th>
+                  <th>Status</th>
+                  <th>Link</th>
+                  <th>Owner</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
               <tbody id="ports-table"></tbody>
             </table>
           </div>
         </div>
       </div>
+
       <!-- Terminal Tab -->
       <div class="tab-pane fade" id="tab-terminal">
         <div class="card">
           <div class="card-header d-flex justify-content-between align-items-center">
             <span><i class="bi bi-terminal"></i> Web Terminal</span>
             <div class="d-flex align-items-center gap-2">
-              <select id="term-port-select" class="form-select form-select-sm" style="width:auto; background:var(--bg-dark); color:var(--text); border-color:var(--border);"><option value="">-- Select Port --</option></select>
+              <select id="term-port-select" class="form-select form-select-sm" style="width:auto; background:var(--bg-dark); color:var(--text); border-color:var(--border);">
+                <option value="">-- Select Port --</option>
+              </select>
               <button class="btn btn-sm btn-outline-light" id="btn-connect" onclick="connectTerminal()"><i class="bi bi-plug"></i> Connect</button>
               <button class="btn btn-sm btn-outline-danger" id="btn-disconnect" onclick="disconnectTerminal()" style="display:none"><i class="bi bi-x-circle"></i> Disconnect</button>
             </div>
           </div>
-          <div class="card-body p-2"><div id="terminal-container"></div></div>
+          <div class="card-body p-2">
+            <div id="terminal-container"></div>
+          </div>
         </div>
       </div>
+
       <!-- Tailscale Tab -->
       <div class="tab-pane fade" id="tab-tailscale">
         <div class="row mb-3">
+          <!-- This Node -->
           <div class="col-md-5">
             <div class="card">
               <div class="card-header d-flex justify-content-between align-items-center">
                 <span><i class="bi bi-pc-display"></i> This Node</span>
-                <button class="btn btn-sm btn-outline-light" onclick="refreshTailscale()"><i class="bi bi-arrow-clockwise"></i></button>
+                <div class="d-flex gap-2">
+                  <button class="btn btn-sm btn-outline-light" onclick="refreshTailscale()"><i class="bi bi-arrow-clockwise"></i></button>
+                </div>
               </div>
               <div class="card-body">
                 <div id="ts-not-running" style="display:none">
@@ -747,29 +1121,48 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
                     <tr><td class="text-muted">Tailnet</td><td><small id="ts-tailnet">-</small></td></tr>
                     <tr><td class="text-muted">OS</td><td id="ts-os">-</td></tr>
                   </table>
-                  <div class="mt-3"><button class="btn btn-sm btn-outline-danger" onclick="tailscaleDown()"><i class="bi bi-power"></i> Disconnect</button></div>
+                  <div class="mt-3 d-flex gap-2">
+                    <button class="btn btn-sm btn-outline-danger" onclick="tailscaleDown()"><i class="bi bi-power"></i> Disconnect</button>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
+          <!-- Peers -->
           <div class="col-md-7">
             <div class="card">
-              <div class="card-header"><span><i class="bi bi-diagram-3"></i> Peers</span><span class="badge bg-secondary ms-2" id="ts-peer-count">0</span></div>
+              <div class="card-header">
+                <span><i class="bi bi-diagram-3"></i> Peers</span>
+                <span class="badge bg-secondary ms-2" id="ts-peer-count">0</span>
+              </div>
               <div class="card-body p-0">
                 <div id="ts-peers-empty" class="text-center text-muted py-4">No peers</div>
                 <table class="table table-sm table-hover mb-0" id="ts-peers-table" style="display:none">
-                  <thead><tr><th></th><th>Hostname</th><th>IP</th><th>OS</th><th>Status</th><th>Action</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th></th>
+                      <th>Hostname</th>
+                      <th>IP</th>
+                      <th>OS</th>
+                      <th>Status</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
                   <tbody id="ts-peers-body"></tbody>
                 </table>
               </div>
             </div>
           </div>
         </div>
+        <!-- Ping result -->
         <div class="card" id="ts-ping-card" style="display:none">
           <div class="card-header"><i class="bi bi-speedometer2"></i> Ping Result</div>
-          <div class="card-body"><pre id="ts-ping-output" style="color:#c5c8ca; background:#111a24; padding:12px; border-radius:6px; margin:0; white-space:pre-wrap;"></pre></div>
+          <div class="card-body">
+            <pre id="ts-ping-output" style="color:#c5c8ca; background:#111a24; padding:12px; border-radius:6px; margin:0; white-space:pre-wrap;"></pre>
+          </div>
         </div>
       </div>
+
       <!-- Logs Tab -->
       <div class="tab-pane fade" id="tab-logs">
         <div class="card">
@@ -777,102 +1170,215 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
             <span><i class="bi bi-journal-text"></i> Session Log</span>
             <button class="btn btn-sm btn-outline-light" onclick="refreshLogs()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
           </div>
-          <div class="card-body"><div id="session-log"><span class="text-muted">Loading...</span></div></div>
+          <div class="card-body">
+            <div id="session-log"><span class="text-muted">Loading...</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings Tab -->
+      <div class="tab-pane fade" id="tab-settings">
+        <div class="row">
+          <!-- Per-Port Settings -->
+          <div class="col-md-8">
+            <div class="card mb-3">
+              <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-sliders"></i> Port Settings</span>
+                <button class="btn btn-sm btn-outline-light" onclick="refreshSettings()"><i class="bi bi-arrow-clockwise"></i></button>
+              </div>
+              <div class="card-body p-0">
+                <table class="table table-sm table-hover mb-0">
+                  <thead>
+                    <tr>
+                      <th>Device</th>
+                      <th>Alias</th>
+                      <th>TCP Port</th>
+                      <th>Baud Rate</th>
+                      <th>Idle Timeout (s)</th>
+                      <th>Max Session (s)</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="settings-ports-table"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <!-- Global & Web Settings -->
+          <div class="col-md-4">
+            <div class="card mb-3">
+              <div class="card-header"><i class="bi bi-globe2"></i> Global Defaults</div>
+              <div class="card-body">
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Default Baud Rate</label>
+                  <select id="set-global-baud" class="form-select form-select-sm" style="background:var(--bg-dark); color:var(--text); border-color:var(--border-strong);">
+                    <option value="9600">9600</option><option value="19200">19200</option>
+                    <option value="38400">38400</option><option value="57600">57600</option>
+                    <option value="115200">115200</option>
+                  </select>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Default Idle Timeout (s)</label>
+                  <input type="number" id="set-global-idle" class="form-control form-control-sm" style="background:var(--bg-dark); color:var(--text); border-color:var(--border-strong);" min="30" max="86400">
+                </div>
+                <div class="mb-2">
+                  <label class="form-label small text-muted">Default Max Session (s)</label>
+                  <input type="number" id="set-global-maxs" class="form-control form-control-sm" style="background:var(--bg-dark); color:var(--text); border-color:var(--border-strong);" min="60" max="604800">
+                </div>
+                <button class="btn btn-sm btn-primary w-100" onclick="saveGlobalSettings()">Save Defaults</button>
+                <small class="text-muted d-block mt-1">Applies to newly created ports only</small>
+                <div id="global-save-msg" class="small mt-2" style="display:none"></div>
+              </div>
+            </div>
+            <div class="card mb-3">
+              <div class="card-header"><i class="bi bi-window-desktop"></i> Web Service</div>
+              <div class="card-body">
+                <table class="table table-sm mb-0">
+                  <tr><td class="text-muted">Listen</td><td id="set-web-host">-</td></tr>
+                  <tr><td class="text-muted">Port</td><td id="set-web-port">-</td></tr>
+                  <tr><td class="text-muted">Admin User</td><td id="set-web-user">-</td></tr>
+                </table>
+                <small class="text-muted d-block mt-2">Edit via: sudo systemctl edit console-gateway-web</small>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-header"><i class="bi bi-shield-lock"></i> SSH</div>
+              <div class="card-body">
+                <table class="table table-sm mb-0">
+                  <tr><td class="text-muted">AllowUsers</td><td id="set-ssh-users">-</td></tr>
+                </table>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </div>
+
   <!-- Rename Modal -->
   <div class="modal fade" id="renameModal" tabindex="-1">
     <div class="modal-dialog modal-dialog-centered">
-      <div class="modal-content" style="background:var(--bg-card); border:1px solid var(--border); color:var(--text);">
+      <div class="modal-content" style="background:var(--bg-card); border:1px solid var(--border-strong); color:var(--text);">
         <div class="modal-header" style="border-color:var(--border);">
-          <h6 class="modal-title"><i class="bi bi-pencil-square"></i> Edit Alias</h6>
+          <h6 class="modal-title"><i class="bi bi-pencil-square" style="color:var(--brand-accent)"></i> Edit Alias</h6>
           <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
           <p class="small text-muted">Device: <code id="rename-old"></code></p>
-          <label class="form-label small">Alias</label>
-          <input type="text" id="rename-input" class="form-control" style="background:var(--bg-dark); color:var(--text); border-color:var(--border);" placeholder="e.g. SW-CORE-01" maxlength="60">
+          <label class="form-label small" style="color:var(--text-muted)">Alias</label>
+          <input type="text" id="rename-input" class="form-control" style="background:var(--bg-dark); color:var(--text); border-color:var(--border-strong);" placeholder="e.g. SW-CORE-01" maxlength="60" pattern="[a-zA-Z0-9][a-zA-Z0-9_-]*">
           <small class="text-muted">Letters, digits, hyphens, underscores. Max 60 chars.</small>
           <div id="rename-error" class="text-danger small mt-2" style="display:none"></div>
         </div>
         <div class="modal-footer" style="border-color:var(--border);">
           <button type="button" class="btn btn-sm btn-outline-light" data-bs-dismiss="modal">Cancel</button>
-          <button type="button" class="btn btn-sm btn-primary" onclick="submitRename()" id="rename-submit-btn">Save</button>
+          <button type="button" class="btn btn-sm btn-primary" onclick="submitRename()" id="rename-submit-btn">Rename</button>
         </div>
       </div>
     </div>
   </div>
+
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
   <script>
-    let term = null, socket = null, connected = false;
+    // ---- State ----
+    let term = null;
+    let socket = null;
+    let connected = false;
 
-    async function api(url, method = 'GET') {
-      const r = await fetch(url, { method, headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+    // ---- API helpers ----
+    async function api(url, method = 'GET', body = null) {
+      const opts = { method, headers: { 'X-Requested-With': 'XMLHttpRequest' } };
+      if (body) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
+      const r = await fetch(url, opts);
       if (r.status === 401) { window.location = '/login'; return null; }
       return r.json();
     }
 
-    // ---- Status ----
+    // ---- Dashboard ----
     async function refreshStatus() {
       const s = await api('/api/status');
       if (!s) return;
       document.getElementById('sys-time').textContent = s.time;
       document.getElementById('sys-host').textContent = s.hostname;
-      document.getElementById('stat-ssh').innerHTML = `<span class="status-dot ${s.ssh==='ok'?'ok':'down'}"></span>${s.ssh==='ok'?'OK':'Down'}`;
+      document.getElementById('stat-ssh').innerHTML = statusHtml(s.ssh);
       const tsText = s.tailscale === 'ok' ? (s.tailscale_ip || 'OK') : 'Not Connected';
-      document.getElementById('stat-tailscale').innerHTML = `<span class="status-dot ${s.tailscale==='ok'?'ok':'down'}"></span>${tsText}`;
+      document.getElementById('stat-tailscale').innerHTML =
+        `<span class="status-dot ${s.tailscale === 'ok' ? 'ok' : 'down'}"></span>${tsText}`;
     }
 
-    // ---- Ports ----
+    function statusHtml(s) {
+      return `<span class="status-dot ${s === 'ok' ? 'ok' : 'down'}"></span>${s === 'ok' ? 'OK' : 'Down'}`;
+    }
+
     async function refreshPorts() {
       const ports = await api('/api/ports');
       if (!ports) return;
       const tbody = document.getElementById('ports-table');
       const sel = document.getElementById('term-port-select');
       const curVal = sel.value;
-      tbody.innerHTML = ''; sel.innerHTML = '<option value="">-- Select Port --</option>';
+      tbody.innerHTML = '';
+      sel.innerHTML = '<option value="">-- Select Port --</option>';
+
       let total = 0, running = 0;
       ports.forEach(p => {
         total++;
         if (p.status === 'running' || p.status === 'busy') running++;
-        tbody.innerHTML += `<tr>
-          <td><code>${p.device}</code></td><td>${p.port}</td><td>${p.baud}</td><td>${p.alias||'-'}</td>
-          <td><span class="badge badge-${p.status}">${p.status}</span></td>
-          <td><small class="text-muted">${p.link_target||''}</small></td>
-          <td><small>${p.owner||'-'}</small></td><td>${buildActions(p)}</td></tr>`;
-        if (p.status === 'running' || p.status === 'busy')
-          sel.innerHTML += `<option value="${p.port}" ${String(p.port)===curVal?'selected':''}>${p.alias||p.device} (:${p.port})</option>`;
+
+        const badgeClass = `badge-${p.status}`;
+        const actions = buildActions(p);
+
+        tbody.innerHTML += `
+          <tr>
+            <td><code>${p.device}</code></td>
+            <td>${p.port}</td>
+            <td>${p.baud}</td>
+            <td>${p.alias || '-'}</td>
+            <td><span class="badge ${badgeClass}">${p.status}</span></td>
+            <td><small class="text-muted">${p.link_target || ''}</small></td>
+            <td><small>${p.owner || '-'}</small></td>
+            <td>${actions}</td>
+          </tr>`;
+
+        if (p.status === 'running' || p.status === 'busy') {
+          sel.innerHTML += `<option value="${p.port}" ${String(p.port) === curVal ? 'selected' : ''}>${p.alias || p.device} (:${p.port})</option>`;
+        }
       });
+
       document.getElementById('stat-total').textContent = total;
       document.getElementById('stat-running').textContent = running;
     }
 
     function buildActions(p) {
-      let h = `<button class="btn btn-sm btn-outline-light me-1" onclick="showRename('${p.device}','${p.alias||''}')" title="Edit Alias"><i class="bi bi-pencil"></i></button>`;
+      let html = '';
+      html += `<button class="btn btn-sm btn-outline-light me-1" onclick="showRename('${p.device}','${p.alias || ''}')" title="Edit Alias"><i class="bi bi-pencil"></i></button>`;
       if (p.status === 'running') {
-        h += `<button class="btn btn-sm btn-outline-light me-1" onclick="portAction('${p.device}','restart')" title="Restart"><i class="bi bi-arrow-repeat"></i></button>`;
-        h += `<button class="btn btn-sm btn-outline-light me-1" onclick="portAction('${p.device}','stop')" title="Stop"><i class="bi bi-stop-circle"></i></button>`;
-        h += `<button class="btn btn-sm btn-outline-light" onclick="openTerminal('${p.port}')" title="Connect"><i class="bi bi-terminal"></i></button>`;
+        html += `<button class="btn btn-sm btn-outline-light me-1" onclick="portAction('${p.device}','restart')" title="Restart"><i class="bi bi-arrow-repeat"></i></button>`;
+        html += `<button class="btn btn-sm btn-outline-light me-1" onclick="portAction('${p.device}','stop')" title="Stop"><i class="bi bi-stop-circle"></i></button>`;
+        html += `<button class="btn btn-sm btn-outline-light" onclick="openTerminal('${p.port}')" title="Connect"><i class="bi bi-terminal"></i></button>`;
       } else if (p.status === 'busy') {
-        h += `<button class="btn btn-sm btn-outline-danger me-1" onclick="portAction('${p.device}','unlock')" title="Unlock"><i class="bi bi-unlock"></i></button>`;
-        h += `<button class="btn btn-sm btn-outline-light me-1" onclick="portAction('${p.device}','kick')" title="Kick & Restart"><i class="bi bi-person-x"></i></button>`;
-        h += `<button class="btn btn-sm btn-outline-light" onclick="portAction('${p.device}','restart')" title="Restart"><i class="bi bi-arrow-repeat"></i></button>`;
+        html += `<button class="btn btn-sm btn-outline-danger me-1" onclick="portAction('${p.device}','unlock')" title="Unlock"><i class="bi bi-unlock"></i></button>`;
+        html += `<button class="btn btn-sm btn-outline-light me-1" onclick="portAction('${p.device}','kick')" title="Kick & Restart"><i class="bi bi-person-x"></i></button>`;
+        html += `<button class="btn btn-sm btn-outline-light" onclick="portAction('${p.device}','restart')" title="Restart"><i class="bi bi-arrow-repeat"></i></button>`;
       } else if (p.status === 'stopped' || p.status === 'no-device') {
-        h += `<button class="btn btn-sm btn-outline-light" onclick="portAction('${p.device}','start')" title="Start"><i class="bi bi-play-circle"></i></button>`;
+        html += `<button class="btn btn-sm btn-outline-light" onclick="portAction('${p.device}','start')" title="Start"><i class="bi bi-play-circle"></i></button>`;
       }
-      return h;
+      return html;
     }
 
     async function portAction(device, action) {
       const r = await api(`/api/ports/${device}/${action}`, 'POST');
-      if (r && r.ok) setTimeout(refreshPorts, 500);
-      else if (r) alert(r.error || 'Failed');
+      if (r && r.ok) {
+        setTimeout(refreshPorts, 500);
+      } else if (r) {
+        alert(r.error || 'Failed');
+      }
     }
 
     // ---- Rename ----
@@ -883,136 +1389,379 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
       document.getElementById('rename-input').value = currentAlias || '';
       document.getElementById('rename-error').style.display = 'none';
       new bootstrap.Modal(document.getElementById('renameModal')).show();
-      setTimeout(() => { const i = document.getElementById('rename-input'); i.focus(); i.select(); }, 300);
+      setTimeout(() => {
+        const input = document.getElementById('rename-input');
+        input.focus();
+        input.select();
+      }, 300);
     }
+
     async function submitRename() {
       const newAlias = document.getElementById('rename-input').value.trim();
       if (!newAlias || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,59}$/.test(newAlias)) {
-        const e = document.getElementById('rename-error'); e.textContent = 'Invalid name.'; e.style.display = ''; return;
+        const err = document.getElementById('rename-error');
+        err.textContent = 'Invalid name. Use letters, digits, hyphens, underscores.';
+        err.style.display = '';
+        return;
       }
-      const btn = document.getElementById('rename-submit-btn'); btn.disabled = true; btn.textContent = 'Saving...';
+      const btn = document.getElementById('rename-submit-btn');
+      btn.disabled = true;
+      btn.textContent = 'Renaming...';
+
       const r = await fetch(`/api/ports/${renameDevice}/rename`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ alias: newAlias }),
       });
-      const d = await r.json(); btn.disabled = false; btn.textContent = 'Save';
-      if (d.ok) { bootstrap.Modal.getInstance(document.getElementById('renameModal')).hide(); setTimeout(refreshPorts, 500); }
-      else { const e = document.getElementById('rename-error'); e.textContent = d.error || 'Failed'; e.style.display = ''; }
+      const d = await r.json();
+      btn.disabled = false;
+      btn.textContent = 'Rename';
+
+      if (d.ok) {
+        bootstrap.Modal.getInstance(document.getElementById('renameModal')).hide();
+        setTimeout(refreshPorts, 500);
+      } else {
+        const err = document.getElementById('rename-error');
+        err.textContent = d.error || 'Rename failed';
+        err.style.display = '';
+      }
     }
-    document.getElementById('rename-input').addEventListener('keydown', e => { if (e.key === 'Enter') submitRename(); });
+
+    // Submit rename on Enter key
+    document.getElementById('rename-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitRename();
+    });
 
     // ---- Terminal ----
     function initTerminal() {
       if (term) return;
-      term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-        theme: { background: '#0d1b2a', foreground: '#e6f1ff', cursor: '#66c0f4' } });
-      const fitAddon = new FitAddon.FitAddon(); term.loadAddon(fitAddon);
-      term.open(document.getElementById('terminal-container')); fitAddon.fit();
+      term = new Terminal({
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+        theme: { background: '#0a0516', foreground: '#E0D8EC', cursor: '#FF6200' },
+      });
+      const fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
       window.addEventListener('resize', () => fitAddon.fit());
-      document.querySelector('a[href="#tab-terminal"]').addEventListener('shown.bs.tab', () => setTimeout(() => fitAddon.fit(), 50));
+
+      // Tab switch refit
+      document.querySelector('a[href="#tab-terminal"]').addEventListener('shown.bs.tab', () => {
+        setTimeout(() => fitAddon.fit(), 50);
+      });
     }
+
     function connectTerminal() {
       const port = document.getElementById('term-port-select').value;
       if (!port) { alert('Please select a port'); return; }
-      initTerminal(); term.clear(); term.writeln('Connecting to port ' + port + '...');
-      if (socket) socket.disconnect();
+      initTerminal();
+      term.clear();
+      term.writeln('Connecting to port ' + port + '...');
+
+      if (socket) { socket.disconnect(); }
       socket = io('/terminal');
-      socket.on('connect', () => { socket.emit('open_terminal', { port: parseInt(port) }); connected = true;
-        document.getElementById('btn-connect').style.display = 'none'; document.getElementById('btn-disconnect').style.display = ''; });
-      socket.on('terminal_output', data => term.write(data.data));
-      socket.on('disconnect', () => { connected = false;
-        document.getElementById('btn-connect').style.display = ''; document.getElementById('btn-disconnect').style.display = 'none'; });
-      term.onData(data => { if (connected) socket.emit('terminal_input', { data }); });
+
+      socket.on('connect', () => {
+        socket.emit('open_terminal', { port: parseInt(port) });
+        connected = true;
+        document.getElementById('btn-connect').style.display = 'none';
+        document.getElementById('btn-disconnect').style.display = '';
+      });
+
+      socket.on('terminal_output', (data) => {
+        term.write(data.data);
+      });
+
+      socket.on('disconnect', () => {
+        connected = false;
+        document.getElementById('btn-connect').style.display = '';
+        document.getElementById('btn-disconnect').style.display = 'none';
+      });
+
+      term.onData((data) => {
+        if (connected) {
+          socket.emit('terminal_input', { data: data });
+        }
+      });
     }
+
     function disconnectTerminal() {
-      if (socket) { socket.emit('close_terminal'); socket.disconnect(); socket = null; }
-      connected = false; document.getElementById('btn-connect').style.display = ''; document.getElementById('btn-disconnect').style.display = 'none';
+      if (socket) {
+        socket.emit('close_terminal');
+        socket.disconnect();
+        socket = null;
+      }
+      connected = false;
+      document.getElementById('btn-connect').style.display = '';
+      document.getElementById('btn-disconnect').style.display = 'none';
       if (term) term.writeln('\r\n[disconnected]');
     }
+
     function openTerminal(port) {
+      // Switch to terminal tab and connect
       document.getElementById('term-port-select').value = String(port);
-      new bootstrap.Tab(document.querySelector('a[href="#tab-terminal"]')).show();
+      const tabEl = document.querySelector('a[href="#tab-terminal"]');
+      new bootstrap.Tab(tabEl).show();
       setTimeout(connectTerminal, 200);
     }
 
     // ---- Logs ----
     async function refreshLogs() {
-      const lines = await api('/api/sessions'); if (!lines) return;
+      const lines = await api('/api/sessions');
+      if (!lines) return;
       const el = document.getElementById('session-log');
-      if (lines.length === 0) { el.innerHTML = '<span class="text-muted">(no sessions yet)</span>'; return; }
+      if (lines.length === 0) {
+        el.innerHTML = '<span class="text-muted">(no sessions yet)</span>';
+        return;
+      }
       el.innerHTML = lines.map(l => `<div class="line">${escapeHtml(l)}</div>`).join('');
       el.scrollTop = el.scrollHeight;
     }
-    function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-    // ---- QR Code ----
+    function escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    // ---- QR Code helper ----
     function showAuthQR(url) {
-      const c = document.getElementById('ts-auth-qr'); c.innerHTML = '';
+      const container = document.getElementById('ts-auth-qr');
+      container.innerHTML = '';
       if (!url) return;
-      const qr = qrcode(0, 'M'); qr.addData(url); qr.make();
-      const img = document.createElement('img'); img.src = qr.createDataURL(6, 8);
-      img.style.borderRadius = '8px'; img.style.border = '4px solid #fff'; c.appendChild(img);
+      const qr = qrcode(0, 'M');
+      qr.addData(url);
+      qr.make();
+      const img = document.createElement('img');
+      img.src = qr.createDataURL(6, 8);
+      img.style.borderRadius = '8px';
+      img.style.border = '4px solid #fff';
+      container.appendChild(img);
     }
 
     // ---- Tailscale ----
     async function refreshTailscale() {
-      const d = await api('/api/tailscale/status'); if (!d) return;
-      const nr = document.getElementById('ts-not-running'), an = document.getElementById('ts-auth-needed'),
-            cn = document.getElementById('ts-connected'), pe = document.getElementById('ts-peers-empty'),
-            pt = document.getElementById('ts-peers-table');
-      nr.style.display = 'none'; an.style.display = 'none'; cn.style.display = 'none';
-      if (!d.daemon_running) { nr.style.display = ''; document.getElementById('ts-not-running-msg').textContent = 'Tailscale daemon is not running'; pe.style.display = ''; pt.style.display = 'none'; return; }
-      if (d.state === 'NeedsLogin' || d.state === 'needs_login') {
-        if (d.auth_url) { an.style.display = ''; document.getElementById('ts-auth-url').href = d.auth_url; showAuthQR(d.auth_url); }
-        else { nr.style.display = ''; document.getElementById('ts-not-running-msg').textContent = 'Tailscale needs login'; }
-        pe.style.display = ''; pt.style.display = 'none'; return;
+      const d = await api('/api/tailscale/status');
+      if (!d) return;
+
+      const notRunning = document.getElementById('ts-not-running');
+      const authNeeded = document.getElementById('ts-auth-needed');
+      const connected = document.getElementById('ts-connected');
+      const peersEmpty = document.getElementById('ts-peers-empty');
+      const peersTable = document.getElementById('ts-peers-table');
+
+      notRunning.style.display = 'none';
+      authNeeded.style.display = 'none';
+      connected.style.display = 'none';
+
+      if (!d.daemon_running) {
+        notRunning.style.display = '';
+        document.getElementById('ts-not-running-msg').textContent = 'Tailscale daemon is not running';
+        peersEmpty.style.display = '';
+        peersTable.style.display = 'none';
+        return;
       }
+
+      if (d.state === 'NeedsLogin' || d.state === 'needs_login') {
+        if (d.auth_url) {
+          authNeeded.style.display = '';
+          const link = document.getElementById('ts-auth-url');
+          link.href = d.auth_url;
+          showAuthQR(d.auth_url);
+        } else {
+          notRunning.style.display = '';
+          document.getElementById('ts-not-running-msg').textContent = 'Tailscale needs login';
+        }
+        peersEmpty.style.display = '';
+        peersTable.style.display = 'none';
+        return;
+      }
+
       if (d.state === 'Running' && d.self) {
-        cn.style.display = '';
+        connected.style.display = '';
         document.getElementById('ts-state').textContent = d.state;
         document.getElementById('ts-hostname').textContent = d.self.hostname;
         document.getElementById('ts-ip').textContent = (d.self.ips || []).join(', ') || '-';
         document.getElementById('ts-dns').textContent = d.self.dns_name || '-';
         document.getElementById('ts-tailnet').textContent = d.self.tailnet || '-';
         document.getElementById('ts-os').textContent = d.self.os || '-';
-        const peers = Object.values(d.peers || {});
-        document.getElementById('ts-peer-count').textContent = peers.length;
-        if (peers.length === 0) { pe.style.display = ''; pt.style.display = 'none'; }
-        else {
-          pe.style.display = 'none'; pt.style.display = '';
-          const tbody = document.getElementById('ts-peers-body'); tbody.innerHTML = '';
-          peers.forEach(p => {
-            const on = p.online, ip = (p.ips||[])[0]||'-', tgt = p.ips&&p.ips[0]?p.ips[0]:p.hostname;
-            tbody.innerHTML += `<tr><td><span class="status-dot ${on?'ok':'down'}"></span></td>
-              <td>${escapeHtml(p.hostname)}<br><small class="text-muted">${escapeHtml(p.dns_name||'')}</small></td>
-              <td><code>${escapeHtml(ip)}</code></td><td>${escapeHtml(p.os)}</td>
-              <td><small>${on?'Online':'Offline'}</small></td>
-              <td>${on?`<button class="btn btn-sm btn-outline-light" onclick="tailscalePing('${escapeHtml(tgt)}')" title="Ping"><i class="bi bi-speedometer2"></i></button>`:''}</td></tr>`;
+
+        // Peers
+        const peers = d.peers || {};
+        const peerList = Object.values(peers);
+        document.getElementById('ts-peer-count').textContent = peerList.length;
+
+        if (peerList.length === 0) {
+          peersEmpty.style.display = '';
+          peersTable.style.display = 'none';
+        } else {
+          peersEmpty.style.display = 'none';
+          peersTable.style.display = '';
+          const tbody = document.getElementById('ts-peers-body');
+          tbody.innerHTML = '';
+          peerList.forEach(p => {
+            const online = p.online;
+            const dotClass = online ? 'ok' : 'down';
+            const statusText = online ? 'Online' : 'Offline';
+            const ip = (p.ips || [])[0] || '-';
+            const pingTarget = p.ips && p.ips[0] ? p.ips[0] : p.hostname;
+            tbody.innerHTML += `
+              <tr>
+                <td><span class="status-dot ${dotClass}"></span></td>
+                <td>${escapeHtml(p.hostname)}<br><small class="text-muted">${escapeHtml(p.dns_name || '')}</small></td>
+                <td><code>${escapeHtml(ip)}</code></td>
+                <td>${escapeHtml(p.os)}</td>
+                <td><small>${statusText}</small></td>
+                <td>${online ? `<button class="btn btn-sm btn-outline-light" onclick="tailscalePing('${escapeHtml(pingTarget)}')" title="Ping"><i class="bi bi-speedometer2"></i></button>` : ''}</td>
+              </tr>`;
           });
         }
-      } else { nr.style.display = ''; document.getElementById('ts-not-running-msg').textContent = 'Tailscale: ' + (d.state||'Unknown'); pe.style.display = ''; pt.style.display = 'none'; }
+      } else {
+        notRunning.style.display = '';
+        document.getElementById('ts-not-running-msg').textContent = 'Tailscale state: ' + (d.state || 'Unknown');
+        peersEmpty.style.display = '';
+        peersTable.style.display = 'none';
+      }
     }
+
     async function tailscaleUp() {
-      document.getElementById('ts-not-running').style.display = 'none';
-      const r = await api('/api/tailscale/up', 'POST'); if (!r) return;
-      if (r.needs_auth && r.auth_url) { const an = document.getElementById('ts-auth-needed'); an.style.display = '';
-        document.getElementById('ts-auth-url').href = r.auth_url; showAuthQR(r.auth_url); }
-      else setTimeout(refreshTailscale, 2000);
+      const notRunning = document.getElementById('ts-not-running');
+      const authNeeded = document.getElementById('ts-auth-needed');
+      notRunning.style.display = 'none';
+
+      const r = await api('/api/tailscale/up', 'POST');
+      if (!r) return;
+      if (r.needs_auth && r.auth_url) {
+        authNeeded.style.display = '';
+        const link = document.getElementById('ts-auth-url');
+        link.href = r.auth_url;
+        link.textContent = 'Open Auth Page';
+        showAuthQR(r.auth_url);
+      } else {
+        setTimeout(refreshTailscale, 2000);
+      }
     }
-    async function tailscaleDown() { if (!confirm('Disconnect Tailscale?')) return; await api('/api/tailscale/down', 'POST'); setTimeout(refreshTailscale, 1000); }
+
+    async function tailscaleDown() {
+      if (!confirm('Disconnect Tailscale?')) return;
+      await api('/api/tailscale/down', 'POST');
+      setTimeout(refreshTailscale, 1000);
+    }
+
     async function tailscalePing(target) {
-      const card = document.getElementById('ts-ping-card'), out = document.getElementById('ts-ping-output');
-      card.style.display = ''; out.textContent = 'Pinging ' + target + '...';
-      const r = await fetch('/api/tailscale/ping', { method: 'POST',
+      const card = document.getElementById('ts-ping-card');
+      const output = document.getElementById('ts-ping-output');
+      card.style.display = '';
+      output.textContent = 'Pinging ' + target + '...';
+      const r = await fetch('/api/tailscale/ping', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-        body: JSON.stringify({ target }) });
-      const d = await r.json(); out.textContent = d.output || d.error || 'No response';
+        body: JSON.stringify({ target }),
+      });
+      const d = await r.json();
+      output.textContent = d.output || d.error || 'No response';
     }
-    document.querySelector('a[href="#tab-tailscale"]').addEventListener('shown.bs.tab', () => refreshTailscale());
+
+    // Load tailscale on tab switch
+    document.querySelector('a[href="#tab-tailscale"]').addEventListener('shown.bs.tab', () => {
+      refreshTailscale();
+    });
+
+    // ---- Settings ----
+    const BAUD_OPTIONS = [9600, 19200, 38400, 57600, 115200];
+
+    async function refreshSettings() {
+      const [ports, global] = await Promise.all([
+        api('/api/settings/ports'),
+        api('/api/settings/global'),
+      ]);
+      if (ports) {
+        const tbody = document.getElementById('settings-ports-table');
+        tbody.innerHTML = '';
+        ports.forEach(p => {
+          const baudOpts = BAUD_OPTIONS.map(b =>
+            `<option value="${b}" ${b === p.baud ? 'selected' : ''}>${b}</option>`
+          ).join('');
+          tbody.innerHTML += `
+            <tr>
+              <td>${escapeHtml(p.device)}</td>
+              <td>${escapeHtml(p.alias || '-')}</td>
+              <td>${p.port}</td>
+              <td><select class="form-select form-select-sm" id="sp-baud-${p.device}"
+                    style="background:var(--bg-dark);color:var(--text);border-color:var(--border);width:auto">${baudOpts}</select></td>
+              <td><input type="number" class="form-control form-control-sm" id="sp-idle-${p.device}"
+                    style="background:var(--bg-dark);color:var(--text);border-color:var(--border);width:90px"
+                    value="${p.idle_timeout}" min="30" max="86400"></td>
+              <td><input type="number" class="form-control form-control-sm" id="sp-maxs-${p.device}"
+                    style="background:var(--bg-dark);color:var(--text);border-color:var(--border);width:90px"
+                    value="${p.max_session}" min="60" max="604800"></td>
+              <td><button class="btn btn-sm btn-outline-light" onclick="savePortSettings('${escapeHtml(p.device)}')"><i class="bi bi-check-lg"></i></button></td>
+            </tr>`;
+        });
+      }
+      if (global) {
+        const c = global.console || {};
+        const w = global.web || {};
+        const s = global.ssh || {};
+        document.getElementById('set-global-baud').value = c.default_baud || 9600;
+        document.getElementById('set-global-idle').value = c.idle_timeout || 900;
+        document.getElementById('set-global-maxs').value = c.max_session || 3600;
+        document.getElementById('set-web-host').textContent = w.host || '-';
+        document.getElementById('set-web-port').textContent = w.port || '-';
+        document.getElementById('set-web-user').textContent = w.admin_user || '-';
+        document.getElementById('set-ssh-users').textContent = s.allow_users || '-';
+      }
+    }
+
+    async function savePortSettings(device) {
+      const baud = parseInt(document.getElementById('sp-baud-' + device).value);
+      const idle = parseInt(document.getElementById('sp-idle-' + device).value);
+      const maxs = parseInt(document.getElementById('sp-maxs-' + device).value);
+      const r = await api('/api/settings/ports/' + device, 'POST', { baud, idle_timeout: idle, max_session: maxs });
+      if (r && r.ok) {
+        showToast('Settings saved for ' + device);
+      }
+    }
+
+    async function saveGlobalSettings() {
+      const baud = parseInt(document.getElementById('set-global-baud').value);
+      const idle = parseInt(document.getElementById('set-global-idle').value);
+      const maxs = parseInt(document.getElementById('set-global-maxs').value);
+      const msg = document.getElementById('global-save-msg');
+      const r = await api('/api/settings/global', 'POST', { default_baud: baud, idle_timeout: idle, max_session: maxs });
+      if (r && r.ok) {
+        msg.textContent = 'Saved!';
+        msg.className = 'small mt-2 text-success';
+        msg.style.display = '';
+        setTimeout(() => msg.style.display = 'none', 3000);
+      } else {
+        msg.textContent = 'Save failed';
+        msg.className = 'small mt-2 text-danger';
+        msg.style.display = '';
+      }
+    }
+
+    function showToast(message) {
+      const el = document.createElement('div');
+      el.className = 'position-fixed bottom-0 end-0 p-3';
+      el.style.zIndex = 9999;
+      el.innerHTML = `<div class="toast show text-light" style="background:var(--bg-card);border:1px solid var(--brand-primary)"><div class="toast-body"><i class="bi bi-check-circle" style="color:var(--brand-green)"></i> ${escapeHtml(message)}</div></div>`;
+      document.body.appendChild(el);
+      setTimeout(() => el.remove(), 3000);
+    }
+
+    document.querySelector('a[href="#tab-settings"]').addEventListener('shown.bs.tab', () => {
+      refreshSettings();
+    });
 
     // ---- Init ----
-    refreshStatus(); refreshPorts(); refreshLogs();
-    setInterval(refreshStatus, 15000); setInterval(refreshPorts, 10000);
+    refreshStatus();
+    refreshPorts();
+    refreshLogs();
+    setInterval(refreshStatus, 15000);
+    setInterval(refreshPorts, 10000);
   </script>
 </body>
 </html>
