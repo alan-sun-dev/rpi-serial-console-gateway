@@ -43,8 +43,8 @@ fi
 
 log() { echo -e "\n[$(date '+%H:%M:%S')] $*"; }
 
-# ====== Compute password hash ======
-PASS_HASH=$(python3 -c "import hashlib; print(hashlib.sha256('${CGW_ADMIN_PASS}'.encode()).hexdigest())")
+# ====== Password hash (computed after venv is ready) ======
+# Deferred until werkzeug is installed in venv
 
 # ====== Install system packages ======
 log "Installing system packages..."
@@ -61,10 +61,12 @@ cat > "${INSTALL_DIR}/app.py" <<'APPEOF'
 #!/usr/bin/env python3
 """Console Gateway Web Management System"""
 
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import subprocess
 import socket
-import hashlib
 import secrets
 import functools
 import json
@@ -73,16 +75,17 @@ from datetime import datetime
 
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from flask_socketio import SocketIO, emit, disconnect
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # --------------- Config ---------------
 MAP_FILE = "/etc/console-gateway/map.tsv"
 SESSION_LOG = "/var/log/console-gateway-sessions.log"
 SECRET_KEY = os.environ.get("CGW_SECRET_KEY", secrets.token_hex(32))
 ADMIN_USER = os.environ.get("CGW_ADMIN_USER", "admin")
-ADMIN_PASS_HASH = os.environ.get(
-    "CGW_ADMIN_PASS_HASH",
-    hashlib.sha256("consolegateway".encode()).hexdigest(),
-)
+# Support both new (werkzeug) and legacy (sha256) hash formats
+ADMIN_PASS_HASH = os.environ.get("CGW_ADMIN_PASS_HASH", "")
+if not ADMIN_PASS_HASH:
+    ADMIN_PASS_HASH = generate_password_hash("consolegateway")
 LISTEN_HOST = os.environ.get("CGW_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("CGW_PORT", "8080"))
 
@@ -95,8 +98,13 @@ terminal_sessions = {}
 
 
 # --------------- Helpers ---------------
-def hash_password(pw):
-    return hashlib.sha256(pw.encode()).hexdigest()
+def verify_password(pw):
+    """Verify password against stored hash (supports werkzeug and legacy sha256)."""
+    if ADMIN_PASS_HASH.startswith(("pbkdf2:", "scrypt:")):
+        return check_password_hash(ADMIN_PASS_HASH, pw)
+    # Legacy sha256 format
+    import hashlib
+    return hashlib.sha256(pw.encode()).hexdigest() == ADMIN_PASS_HASH
 
 
 def login_required(f):
@@ -216,7 +224,7 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "")
         password = request.form.get("password", "")
-        if username == ADMIN_USER and hash_password(password) == ADMIN_PASS_HASH:
+        if username == ADMIN_USER and verify_password(password):
             session["logged_in"] = True
             session["username"] = username
             return redirect(url_for("dashboard"))
@@ -250,7 +258,7 @@ def api_restart_port(device):
     if not re.match(r'^[a-zA-Z0-9_-]+$', device):
         return jsonify({"error": "invalid device name"}), 400
     svc = f"console-lock-bridge@{device}.service"
-    rc, out, err = run_cmd(["sudo", "systemctl", "restart", svc])
+    rc, out, err = run_cmd(["systemctl", "restart", svc])
     if rc == 0:
         return jsonify({"ok": True, "message": f"Restarted {svc}"})
     return jsonify({"error": err}), 500
@@ -261,10 +269,17 @@ def api_restart_port(device):
 def api_kick_port(device):
     if not re.match(r'^[a-zA-Z0-9_-]+$', device):
         return jsonify({"error": "invalid device name"}), 400
+    # Kill active sessions holding this device, clear lock/owner
+    lock_file = f"/run/console-gateway.{device}.lock"
+    owner_file = f"/run/console-gateway.{device}.owner"
+    run_cmd(["bash", "-c",
+        f"fuser /dev/{device} 2>/dev/null | xargs -r kill 2>/dev/null; "
+        f"rm -f {lock_file} {owner_file}"])
+    # Then restart the bridge service
     svc = f"console-lock-bridge@{device}.service"
-    rc, out, err = run_cmd(["sudo", "systemctl", "restart", svc])
+    rc, out, err = run_cmd(["systemctl", "restart", svc])
     if rc == 0:
-        return jsonify({"ok": True, "message": f"Kicked sessions on {device}"})
+        return jsonify({"ok": True, "message": f"Kicked sessions and restarted {device}"})
     return jsonify({"error": err}), 500
 
 
@@ -291,7 +306,7 @@ def api_stop_port(device):
     if not re.match(r'^[a-zA-Z0-9_-]+$', device):
         return jsonify({"error": "invalid device name"}), 400
     svc = f"console-lock-bridge@{device}.service"
-    rc, out, err = run_cmd(["sudo", "systemctl", "stop", svc])
+    rc, out, err = run_cmd(["systemctl", "stop", svc])
     if rc == 0:
         return jsonify({"ok": True, "message": f"Stopped {svc}"})
     return jsonify({"error": err}), 500
@@ -342,7 +357,7 @@ def api_start_port(device):
     if not re.match(r'^[a-zA-Z0-9_-]+$', device):
         return jsonify({"error": "invalid device name"}), 400
     svc = f"console-lock-bridge@{device}.service"
-    rc, out, err = run_cmd(["sudo", "systemctl", "start", svc])
+    rc, out, err = run_cmd(["systemctl", "start", svc])
     if rc == 0:
         return jsonify({"ok": True, "message": f"Started {svc}"})
     return jsonify({"error": err}), 500
@@ -450,10 +465,20 @@ def api_settings_port_update(device):
     if max_session is not None and (int(max_session) < 60 or int(max_session) > 604800):
         return jsonify({"error": "Max session must be 60-604800 seconds"}), 400
 
-    # Read current settings
+    # Read current settings (create defaults from map if drop-in doesn't exist yet)
     current = read_port_settings(device)
     if not current:
-        return jsonify({"error": f"No settings found for {device}"}), 404
+        # Find device in map to get baseline values
+        map_entry = next((p for p in read_map() if p["device"] == device), None)
+        if not map_entry:
+            return jsonify({"error": f"Device {device} not found in map"}), 404
+        current = {
+            "CONSOLE_DEV": f"/dev/{device}",
+            "CONSOLE_BAUD": str(map_entry["baud"]),
+            "LOCAL_CONSOLE_PORT": str(map_entry["port"]),
+            "IDLE_TIMEOUT_SECONDS": "900",
+            "MAX_SESSION_SECONDS": "3600",
+        }
 
     # Update values
     if baud is not None:
@@ -489,14 +514,14 @@ def api_settings_port_update(device):
     for k, v in current.items():
         content += f"Environment={k}={v}\n"
 
-    rc, _, err = run_cmd(["sudo", "bash", "-c",
+    rc, _, err = run_cmd(["bash", "-c",
         f"mkdir -p '{conf_dir}' && cat > '{conf_file}' << 'CONFEOF'\n{content}CONFEOF"])
     if rc != 0:
         return jsonify({"error": f"Failed to write config: {err}"}), 500
 
     # Reload and restart
-    run_cmd(["sudo", "systemctl", "daemon-reload"])
-    run_cmd(["sudo", "systemctl", "restart", f"console-lock-bridge@{device}.service"])
+    run_cmd(["systemctl", "daemon-reload"])
+    run_cmd(["systemctl", "restart", f"console-lock-bridge@{device}.service"])
 
     return jsonify({"ok": True, "message": f"Settings updated for {device}"})
 
@@ -589,12 +614,12 @@ def api_settings_global_update():
         content = re.sub(r'Environment=MAX_SESSION_SECONDS=\d+',
                          f'Environment=MAX_SESSION_SECONDS={int(maxs)}', content)
 
-    rc, _, err = run_cmd(["sudo", "bash", "-c",
+    rc, _, err = run_cmd(["bash", "-c",
         f"cat > '{template}' << 'CONFEOF'\n{content}CONFEOF"])
     if rc != 0:
         return jsonify({"error": f"Failed: {err}"}), 500
 
-    run_cmd(["sudo", "systemctl", "daemon-reload"])
+    run_cmd(["systemctl", "daemon-reload"])
     return jsonify({"ok": True, "message": "Global defaults updated. New ports will use these values."})
 
 
@@ -649,7 +674,7 @@ def api_tailscale_status():
 @app.route("/api/tailscale/up", methods=["POST"])
 @login_required
 def api_tailscale_up():
-    rc, out, err = run_cmd(["sudo", "tailscale", "up"], timeout=15)
+    rc, out, err = run_cmd(["tailscale", "up"], timeout=15)
     combined = (out + err).strip()
     # Check if it needs browser auth
     login_url = None
@@ -666,7 +691,7 @@ def api_tailscale_up():
 @app.route("/api/tailscale/down", methods=["POST"])
 @login_required
 def api_tailscale_down():
-    rc, out, err = run_cmd(["sudo", "tailscale", "down"], timeout=10)
+    rc, out, err = run_cmd(["tailscale", "down"], timeout=10)
     if rc == 0:
         return jsonify({"ok": True, "message": "Tailscale disconnected"})
     return jsonify({"error": err}), 500
@@ -702,6 +727,13 @@ def open_terminal(data):
         return
 
     port = int(port)
+
+    # Validate port is in the allowed map (prevent connecting to arbitrary local services)
+    allowed_ports = {p["port"] for p in read_map()}
+    if port not in allowed_ports:
+        emit("terminal_output", {"data": "[error] Port not in allowed list\r\n"})
+        return
+
     sid = request.sid
 
     # Close existing session if any
@@ -1226,7 +1258,7 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
                   <input type="number" id="set-global-maxs" class="form-control form-control-sm" style="background:var(--bg-dark); color:var(--text); border-color:var(--border-strong);" min="60" max="604800">
                 </div>
                 <button class="btn btn-sm btn-primary w-100" onclick="saveGlobalSettings()">Save Defaults</button>
-                <small class="text-muted d-block mt-1">Applies to newly created ports only</small>
+                <small class="text-muted d-block mt-1">Applies to ports without per-port overrides</small>
                 <div id="global-save-msg" class="small mt-2" style="display:none"></div>
               </div>
             </div>
@@ -1774,6 +1806,10 @@ if [[ ! -d "${INSTALL_DIR}/venv" ]]; then
 fi
 "${INSTALL_DIR}/venv/bin/pip" install --quiet flask flask-socketio eventlet pyserial
 
+# ====== Compute password hash (werkzeug, with salt) ======
+log "Generating password hash..."
+PASS_HASH=$("${INSTALL_DIR}/venv/bin/python" -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('${CGW_ADMIN_PASS}'))")
+
 # ====== Create systemd service ======
 log "Installing systemd service..."
 cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
@@ -1839,15 +1875,18 @@ cat <<NOTES
 
   URL:       http://${LOCAL_IP:-localhost}:${CGW_PORT}
 ${TS_IP:+  Tailscale: http://${TS_IP}:${CGW_PORT}}
-  Login:     ${CGW_ADMIN_USER} / ${CGW_ADMIN_PASS}
+  Login:     ${CGW_ADMIN_USER} / (password set during install)
   Install:   ${INSTALL_DIR}
 
   Service:   sudo systemctl {start|stop|restart|status} ${SERVICE_NAME}
   Uninstall: sudo ${INSTALL_DIR}/uninstall.sh
 
   Change password:
+    NEW_HASH=\$(${INSTALL_DIR}/venv/bin/python -c \\
+      "from werkzeug.security import generate_password_hash; \\
+       print(generate_password_hash(input('New password: ')))")
     sudo systemctl edit ${SERVICE_NAME}
-    # Add: Environment=CGW_ADMIN_PASS_HASH=<sha256-hex>
+    # Set: Environment=CGW_ADMIN_PASS_HASH=\$NEW_HASH
     sudo systemctl restart ${SERVICE_NAME}
 
 ============================================
