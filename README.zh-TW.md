@@ -50,6 +50,7 @@ Raspberry Pi 多埠獨佔式 Console 伺服器 — 透過 Tailscale VPN、SSH �
 - **閒置與最長連線逾時** — 自動中斷閒置或超時的連線
 - **systemd 管理** — 樣板 unit 搭配各裝置獨立的 drop-in 覆寫
 - **一鍵解除安裝** — 乾淨移除所有元件
+- **網頁管理介面** — 可選的瀏覽器管理介面，含 Web Terminal、埠管理、Tailscale 控制、連線日誌
 
 ## 系統需求
 
@@ -393,6 +394,77 @@ sudo ufw status verbose
 | 程式碼量 | ~1,300 行 bash | ~15,000+ 行 Python + bash |
 
 console-gateway 專為需要**簡單、安全、無衝突** console 伺服器且相依性最少的團隊而設計。若你需要多 Pi 叢集、電源插座控制或完整的 TUI 體驗，ConsolePi 更適合。
+
+## 網頁管理介面
+
+提供可選的瀏覽器管理介面，安裝於現有的 Console Gateway 之上。
+
+### 功能
+
+- **Dashboard** — 即時埠狀態（running/stopped/busy）、SSH 與 Tailscale 健康狀態
+- **Web Terminal** — 直接在瀏覽器連線 Serial Console（xterm.js + WebSocket）
+- **埠管理** — Start/Stop/Restart/Kick/Unlock、編輯別名
+- **Tailscale 管理** — 連線/斷線、Peers 列表、Ping、QR Code 手機認證
+- **連線日誌** — 瀏覽連線歷史記錄
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  瀏覽器  http://<pi-ip>:8080                             │
+│  ┌─────┐ ┌──────────┐ ┌───────────┐ ┌─────────────┐    │
+│  │Ports│ │ Terminal  │ │ Tailscale │ │ Session Log │    │
+│  └──┬──┘ └────┬─────┘ └─────┬─────┘ └──────┬──────┘    │
+│     │         │              │              │           │
+│     ▼         ▼              ▼              ▼           │
+│  map.tsv   WebSocket     tailscale      sessions.log   │
+│  systemctl  :200x         CLI            tail          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 安裝網頁介面
+
+```bash
+# 預設：port 8080，帳號 admin / consolegateway
+sudo bash console-gateway-web-install.sh
+
+# 自訂設定
+sudo bash console-gateway-web-install.sh --port 9090 --password mypassword
+
+# 或從 GitHub 直接安裝
+curl -sL https://raw.githubusercontent.com/alan-sun-dev/rpi-serial-console-gateway/main/console-gateway-web-install.sh | sudo bash
+```
+
+### 選項
+
+| 選項 | 預設值 | 說明 |
+|------|--------|------|
+| `--port` | `8080` | Web 伺服器埠 |
+| `--password` | `consolegateway` | 管理員密碼 |
+| `--user` | `admin` | 管理員帳號 |
+| `--host` | `0.0.0.0` | 監聽位址 |
+| `--dir` | `/opt/console-gateway-web` | 安裝目錄 |
+
+### 服務管理
+
+```bash
+sudo systemctl status console-gateway-web    # 查看狀態
+sudo systemctl restart console-gateway-web   # 重啟
+sudo systemctl stop console-gateway-web      # 停止
+
+# 修改密碼
+sudo systemctl edit console-gateway-web
+# 加入: Environment=CGW_ADMIN_PASS_HASH=<sha256-hex>
+sudo systemctl restart console-gateway-web
+
+# 解除安裝網頁介面
+sudo /opt/console-gateway-web/uninstall.sh
+```
+
+### 技術架構
+
+- **後端：** Python Flask + Flask-SocketIO（eventlet）
+- **前端：** Bootstrap 5 + xterm.js + socket.io + qrcode-generator
+- **認證：** SHA-256 密碼雜湊，session-based 登入
+- **部署：** Python venv 安裝於 `/opt/console-gateway-web/`，systemd 管理
 
 ## 解除安裝
 

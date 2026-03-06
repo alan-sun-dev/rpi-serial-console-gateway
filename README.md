@@ -50,6 +50,7 @@ Multi-port exclusive console server for Raspberry Pi — remote access to Cisco/
 - **Idle & max timeout** — auto-disconnect inactive or long-running sessions
 - **systemd managed** — template units with per-device drop-in overrides
 - **One-command uninstall** — clean removal of all components
+- **Web management UI** — optional browser-based dashboard with web terminal, port management, Tailscale control, and session logs
 
 ## Requirements
 
@@ -310,6 +311,14 @@ sudo ufw status verbose
 /dev/
 ├── cgw-SW-CORE-01 -> ttyUSB0    # persistent symlink (udev-managed)
 └── cgw-RTR-WAN-01 -> ttyUSB1    # persistent symlink (udev-managed)
+
+/opt/console-gateway-web/          # (optional) web management UI
+├── app.py                         # Flask + SocketIO application
+├── venv/                          # Python virtual environment
+├── templates/
+│   ├── login.html
+│   └── dashboard.html
+└── uninstall.sh
 ```
 
 ## Comparison with ConsolePi
@@ -328,6 +337,77 @@ sudo ufw status verbose
 | Code size | ~1,300 lines bash | ~15,000+ lines Python + bash |
 
 console-gateway is designed for teams that need a **simple, secure, conflict-free** console server with minimal dependencies. ConsolePi is a better fit if you need multi-Pi clustering, power outlet control, or a full TUI experience.
+
+## Web Management UI
+
+A browser-based management interface is available as an optional add-on. Install it on top of an existing Console Gateway setup.
+
+### Web UI Features
+
+- **Dashboard** — real-time port status (running/stopped/busy), SSH & Tailscale health overview
+- **Web Terminal** — connect to serial consoles directly from the browser (xterm.js + WebSocket)
+- **Port Management** — start/stop/restart/kick/unlock ports, edit aliases — all from the UI
+- **Tailscale Management** — connect/disconnect, view peers, ping, QR code for mobile authentication
+- **Session Log** — browse connection history
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Browser  http://<pi-ip>:8080                           │
+│  ┌─────┐ ┌──────────┐ ┌───────────┐ ┌─────────────┐    │
+│  │Ports│ │ Terminal  │ │ Tailscale │ │ Session Log │    │
+│  └──┬──┘ └────┬─────┘ └─────┬─────┘ └──────┬──────┘    │
+│     │         │              │              │           │
+│     ▼         ▼              ▼              ▼           │
+│  map.tsv   WebSocket     tailscale      sessions.log   │
+│  systemctl  :200x         CLI            tail          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Install Web UI
+
+```bash
+# Default: port 8080, login admin/consolegateway
+sudo bash console-gateway-web-install.sh
+
+# Custom settings
+sudo bash console-gateway-web-install.sh --port 9090 --password mypassword
+
+# Or install directly from GitHub
+curl -sL https://raw.githubusercontent.com/alan-sun-dev/rpi-serial-console-gateway/main/console-gateway-web-install.sh | sudo bash
+```
+
+### Web UI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--port` | `8080` | Web server port |
+| `--password` | `consolegateway` | Admin password |
+| `--user` | `admin` | Admin username |
+| `--host` | `0.0.0.0` | Listen address |
+| `--dir` | `/opt/console-gateway-web` | Install directory |
+
+### Web UI Service
+
+```bash
+sudo systemctl status console-gateway-web    # check status
+sudo systemctl restart console-gateway-web   # restart
+sudo systemctl stop console-gateway-web      # stop
+
+# Change password
+sudo systemctl edit console-gateway-web
+# Add: Environment=CGW_ADMIN_PASS_HASH=<sha256-hex>
+sudo systemctl restart console-gateway-web
+
+# Uninstall
+sudo /opt/console-gateway-web/uninstall.sh
+```
+
+### Web UI Tech Stack
+
+- **Backend:** Python Flask + Flask-SocketIO (eventlet)
+- **Frontend:** Bootstrap 5 + xterm.js + socket.io + qrcode-generator
+- **Auth:** SHA-256 password hash, session-based login
+- **Install:** Python venv in `/opt/console-gateway-web/`, systemd managed
 
 ## Uninstall
 
