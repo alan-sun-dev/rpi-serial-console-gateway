@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Console Gateway Web Management - Installer v1.1
+# Console Gateway Web Management - Installer v1.2
 # Installs the web UI on top of an existing Console Gateway v2.9 setup.
 # Usage: sudo bash console-gateway-web-install.sh [--port 8080] [--password mypass]
+#
+# v1.2:
+#   - Feature: Network tab — iPhone USB Gateway integration
+#     - Live WAN/LAN status, IP, traffic stats from iphone-gw status file
+#     - Service health dashboard (iphone-gw, timer, dnsmasq, nftables)
+#     - Pair / Reconnect buttons (idevicepair + systemctl restart)
+#     - Graceful "not installed" state when iphone-gw is absent
 #
 # v1.1 fixes:
 #   - Security: password hashing upgraded from bare SHA-256 to werkzeug pbkdf2 (salted)
@@ -690,6 +697,165 @@ def api_settings_global_update():
     return jsonify({"ok": True, "message": "Global defaults updated."})
 
 
+# --------------- iPhone Gateway API ---------------
+IPHONE_GW_STATUS = "/run/iphone-gw.status"
+IPHONE_GW_SERVICE = "iphone-gw.service"
+IPHONE_GW_LOG = "/var/log/iphone-gw.log"
+
+
+def _read_kv_file(path):
+    """Parse a key=value status file."""
+    data = {}
+    if not os.path.isfile(path):
+        return data
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    data[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return data
+
+
+def _iface_ip(iface):
+    """Get IPv4 address of a network interface."""
+    try:
+        r = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        for part in r.stdout.split():
+            if "/" in part and "." in part:
+                return part.split("/")[0]
+    except Exception:
+        pass
+    return None
+
+
+def _iface_stats(iface):
+    """Read RX/TX byte counters from sysfs."""
+    def _read(name):
+        try:
+            with open(f"/sys/class/net/{iface}/statistics/{name}") as f:
+                return int(f.read().strip())
+        except Exception:
+            return 0
+    return {"rx_bytes": _read("rx_bytes"), "tx_bytes": _read("tx_bytes")}
+
+
+def _sys_val(iface, item):
+    """Read a value from /sys/class/net/<iface>/<item>."""
+    try:
+        with open(f"/sys/class/net/{iface}/{item}") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _service_active(name):
+    try:
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", name],
+            capture_output=True, timeout=5,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
+@app.route("/api/iphone/status")
+@login_required
+def api_iphone_status():
+    """iPhone USB Gateway status — reads status file + live sysfs data."""
+    installed = os.path.isfile("/usr/local/sbin/iphone-gw-up") or \
+                _service_active(IPHONE_GW_SERVICE)
+
+    if not installed:
+        return jsonify({
+            "installed": False,
+            "note": "iPhone Gateway is not installed. Run iphone-gw-install-v11.sh to set up.",
+        })
+
+    status = _read_kv_file(IPHONE_GW_STATUS)
+    wan = status.get("wan_if", "")
+    lan = status.get("lan_if", "eth0")
+
+    # Live interface data
+    wan_op = _sys_val(wan, "operstate") if wan else "unknown"
+    wan_car = _sys_val(wan, "carrier") if wan else "0"
+    wan_ready = wan_op == "up" and wan_car == "1"
+    wan_ip = _iface_ip(wan) if wan else None
+    lan_ip = _iface_ip(lan) if lan else None
+    stats = _iface_stats(wan) if wan else {"rx_bytes": 0, "tx_bytes": 0}
+
+    # Services
+    services = {
+        "iphone-gw": _service_active(IPHONE_GW_SERVICE),
+        "iphone-gw.timer": _service_active("iphone-gw.timer"),
+        "dnsmasq": _service_active("dnsmasq"),
+        "nftables": _service_active("nftables"),
+    }
+
+    # idevicepair status
+    pair_rc, pair_out, _ = run_cmd(["idevicepair", "validate"], timeout=5)
+
+    # Traffic log (last 5 lines)
+    traffic_lines = []
+    if os.path.isfile(IPHONE_GW_LOG):
+        try:
+            r = subprocess.run(
+                ["tail", "-n", "5", IPHONE_GW_LOG],
+                capture_output=True, text=True, timeout=5,
+            )
+            traffic_lines = [l for l in r.stdout.strip().split("\n") if l]
+        except Exception:
+            pass
+
+    return jsonify({
+        "installed": True,
+        "wan_if": wan or "none",
+        "lan_if": lan,
+        "wan_ip": wan_ip,
+        "lan_ip": lan_ip,
+        "wan_operstate": wan_op,
+        "wan_carrier": wan_car,
+        "wan_ready": wan_ready,
+        "rx_bytes": stats["rx_bytes"],
+        "tx_bytes": stats["tx_bytes"],
+        "services": services,
+        "paired": pair_rc == 0,
+        "pair_message": pair_out.strip() if pair_out else "",
+        "note": status.get("note", ""),
+        "updated": status.get("updated", ""),
+        "traffic_log": traffic_lines,
+    })
+
+
+@app.route("/api/iphone/pair", methods=["POST"])
+@login_required
+@csrf_required
+def api_iphone_pair():
+    """Trigger idevicepair pair (iPhone must show Trust dialog)."""
+    rc, out, err = run_cmd(["idevicepair", "pair"], timeout=15)
+    combined = (out + err).strip()
+    if rc == 0 or "SUCCESS" in combined.upper():
+        return jsonify({"ok": True, "message": combined or "Paired successfully"})
+    return jsonify({"ok": False, "error": combined or "Pair failed. Tap 'Trust' on iPhone."}), 400
+
+
+@app.route("/api/iphone/reconnect", methods=["POST"])
+@login_required
+@csrf_required
+def api_iphone_reconnect():
+    """Restart iPhone Gateway service to re-detect WAN."""
+    rc, out, err = run_cmd(["systemctl", "restart", IPHONE_GW_SERVICE], timeout=15)
+    if rc == 0:
+        return jsonify({"ok": True, "message": "Gateway service restarted"})
+    return jsonify({"error": (err or "restart failed").strip()}), 500
+
+
 # --------------- Tailscale API ---------------
 @app.route("/api/tailscale/status")
 @login_required
@@ -1132,6 +1298,9 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
         <a class="nav-link" data-bs-toggle="tab" href="#tab-terminal"><i class="bi bi-terminal"></i> Terminal</a>
       </li>
       <li class="nav-item">
+        <a class="nav-link" data-bs-toggle="tab" href="#tab-network"><i class="bi bi-phone"></i> Network</a>
+      </li>
+      <li class="nav-item">
         <a class="nav-link" data-bs-toggle="tab" href="#tab-tailscale"><i class="bi bi-globe2"></i> Tailscale</a>
       </li>
       <li class="nav-item">
@@ -1185,6 +1354,93 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
           </div>
           <div class="card-body p-2">
             <div id="terminal-container"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Network (iPhone Gateway) Tab -->
+      <div class="tab-pane fade" id="tab-network">
+        <div id="iphone-not-installed" style="display:none">
+          <div class="card">
+            <div class="card-body text-center py-5">
+              <i class="bi bi-phone text-muted" style="font-size:3rem"></i>
+              <p class="mt-3 text-muted">iPhone USB Gateway is not installed.</p>
+              <p class="small text-muted">Run <code>iphone-gw-install-v11.sh</code> to enable iPhone USB tethering as WAN uplink.</p>
+            </div>
+          </div>
+        </div>
+        <div id="iphone-installed" style="display:none">
+          <div class="row mb-3">
+            <!-- WAN Status -->
+            <div class="col-md-6">
+              <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                  <span><i class="bi bi-phone"></i> iPhone WAN</span>
+                  <div class="d-flex gap-2">
+                    <button class="btn btn-sm btn-outline-light" onclick="refreshIphone()"><i class="bi bi-arrow-clockwise"></i></button>
+                  </div>
+                </div>
+                <div class="card-body">
+                  <div id="iphone-note-banner" class="mb-3" style="display:none">
+                    <div style="padding:10px; background:rgba(222,0,46,0.15); border-left:4px solid var(--brand-red); border-radius:4px; color:#ffa8a8;">
+                      <small><i class="bi bi-exclamation-triangle"></i> <span id="iphone-note-text"></span></small>
+                    </div>
+                  </div>
+                  <table class="table table-sm mb-0">
+                    <tr>
+                      <td class="text-muted" style="width:130px">WAN Interface</td>
+                      <td><code id="iph-wan-if">-</code></td>
+                    </tr>
+                    <tr>
+                      <td class="text-muted">WAN IP</td>
+                      <td id="iph-wan-ip">-</td>
+                    </tr>
+                    <tr>
+                      <td class="text-muted">Link Status</td>
+                      <td id="iph-link-status">-</td>
+                    </tr>
+                    <tr>
+                      <td class="text-muted">Traffic (RX / TX)</td>
+                      <td id="iph-traffic">-</td>
+                    </tr>
+                    <tr>
+                      <td class="text-muted">LAN Interface</td>
+                      <td><code id="iph-lan-if">-</code></td>
+                    </tr>
+                    <tr>
+                      <td class="text-muted">LAN IP</td>
+                      <td id="iph-lan-ip">-</td>
+                    </tr>
+                    <tr>
+                      <td class="text-muted">iPhone Paired</td>
+                      <td id="iph-paired">-</td>
+                    </tr>
+                  </table>
+                  <div class="mt-3 d-flex gap-2">
+                    <button class="btn btn-sm btn-primary" onclick="iphonePair()"><i class="bi bi-link-45deg"></i> Pair iPhone</button>
+                    <button class="btn btn-sm btn-outline-light" onclick="iphoneReconnect()"><i class="bi bi-arrow-repeat"></i> Reconnect</button>
+                  </div>
+                  <div id="iph-action-msg" class="small mt-2" style="display:none"></div>
+                </div>
+              </div>
+            </div>
+            <!-- Services & Traffic Log -->
+            <div class="col-md-6">
+              <div class="card mb-3">
+                <div class="card-header"><i class="bi bi-gear"></i> Gateway Services</div>
+                <div class="card-body">
+                  <table class="table table-sm mb-0">
+                    <tbody id="iph-services"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div class="card">
+                <div class="card-header"><i class="bi bi-speedometer2"></i> Traffic Log (recent)</div>
+                <div class="card-body p-0">
+                  <pre id="iph-traffic-log" style="color:#c5c8ca; background:#0a0516; padding:12px; margin:0; font-size:.8rem; max-height:200px; overflow-y:auto; white-space:pre-wrap;"></pre>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1782,6 +2038,127 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
       refreshTailscale();
     });
 
+    // ---- iPhone Gateway ----
+    function fmtBytes(b) {
+      if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GB';
+      if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+      if (b >= 1024) return (b / 1024).toFixed(0) + ' KB';
+      return b + ' B';
+    }
+
+    async function refreshIphone() {
+      const d = await api('/api/iphone/status');
+      if (!d) return;
+
+      const notInstalled = document.getElementById('iphone-not-installed');
+      const installed = document.getElementById('iphone-installed');
+
+      if (!d.installed) {
+        notInstalled.style.display = '';
+        installed.style.display = 'none';
+        return;
+      }
+      notInstalled.style.display = 'none';
+      installed.style.display = '';
+
+      // Note banner
+      const banner = document.getElementById('iphone-note-banner');
+      if (d.note && !d.note.startsWith('OK')) {
+        document.getElementById('iphone-note-text').textContent = d.note;
+        banner.style.display = '';
+      } else {
+        banner.style.display = 'none';
+      }
+
+      // WAN info
+      document.getElementById('iph-wan-if').textContent = d.wan_if || 'none';
+      const wanIpEl = document.getElementById('iph-wan-ip');
+      if (d.wan_ip) {
+        wanIpEl.innerHTML = `<code class="text-success">${escapeHtml(d.wan_ip)}</code>`;
+      } else {
+        wanIpEl.innerHTML = '<span class="text-danger">Disconnected</span>';
+      }
+
+      // Link
+      const linkEl = document.getElementById('iph-link-status');
+      if (d.wan_ready) {
+        linkEl.innerHTML = '<span class="status-dot ok"></span>Up';
+      } else {
+        linkEl.innerHTML = `<span class="status-dot down"></span>${escapeHtml(d.wan_operstate || 'unknown')} / carrier: ${escapeHtml(d.wan_carrier || '0')}`;
+      }
+
+      // Traffic
+      document.getElementById('iph-traffic').textContent =
+        fmtBytes(d.rx_bytes || 0) + ' / ' + fmtBytes(d.tx_bytes || 0);
+
+      // LAN
+      document.getElementById('iph-lan-if').textContent = d.lan_if || '-';
+      document.getElementById('iph-lan-ip').innerHTML = d.lan_ip
+        ? `<code>${escapeHtml(d.lan_ip)}</code>` : '-';
+
+      // Paired
+      const pairedEl = document.getElementById('iph-paired');
+      if (d.paired) {
+        pairedEl.innerHTML = '<span class="badge badge-running">Yes</span>';
+      } else {
+        pairedEl.innerHTML = '<span class="badge badge-stopped">No</span>';
+      }
+
+      // Services
+      const svcBody = document.getElementById('iph-services');
+      svcBody.innerHTML = '';
+      const svcNames = { 'iphone-gw': 'Gateway', 'iphone-gw.timer': 'Health Timer', 'dnsmasq': 'DHCP/DNS', 'nftables': 'Firewall' };
+      for (const [key, label] of Object.entries(svcNames)) {
+        const active = d.services && d.services[key];
+        svcBody.innerHTML += `<tr>
+          <td class="text-muted">${escapeHtml(label)}</td>
+          <td><span class="status-dot ${active ? 'ok' : 'down'}"></span>${active ? 'Active' : 'Inactive'}</td>
+        </tr>`;
+      }
+
+      // Traffic log
+      const logEl = document.getElementById('iph-traffic-log');
+      logEl.textContent = (d.traffic_log || []).join('\n') || '(no traffic data)';
+    }
+
+    async function iphonePair() {
+      const msg = document.getElementById('iph-action-msg');
+      msg.textContent = 'Pairing... Tap "Trust" on your iPhone screen.';
+      msg.className = 'small mt-2 text-warning';
+      msg.style.display = '';
+      const r = await api('/api/iphone/pair', 'POST');
+      if (r && r.ok) {
+        msg.textContent = r.message || 'Paired!';
+        msg.className = 'small mt-2 text-success';
+        setTimeout(refreshIphone, 1500);
+      } else {
+        msg.textContent = (r && r.error) || 'Pair failed';
+        msg.className = 'small mt-2 text-danger';
+      }
+      setTimeout(() => msg.style.display = 'none', 5000);
+    }
+
+    async function iphoneReconnect() {
+      const msg = document.getElementById('iph-action-msg');
+      msg.textContent = 'Restarting gateway service...';
+      msg.className = 'small mt-2 text-warning';
+      msg.style.display = '';
+      const r = await api('/api/iphone/reconnect', 'POST');
+      if (r && r.ok) {
+        msg.textContent = r.message || 'Reconnected!';
+        msg.className = 'small mt-2 text-success';
+        setTimeout(refreshIphone, 2000);
+      } else {
+        msg.textContent = (r && r.error) || 'Reconnect failed';
+        msg.className = 'small mt-2 text-danger';
+      }
+      setTimeout(() => msg.style.display = 'none', 5000);
+    }
+
+    document.querySelector('a[href="#tab-network"]').addEventListener('shown.bs.tab', () => {
+      refreshIphone();
+    });
+
     // ---- Settings ----
     const BAUD_OPTIONS = [9600, 19200, 38400, 57600, 115200];
 
@@ -1883,7 +2260,6 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
 </body>
 </html>
 DASHEOF
-
 # ====== Create Python venv ======
 log "Setting up Python virtual environment..."
 if [[ ! -d "${INSTALL_DIR}/venv" ]]; then
@@ -1955,7 +2331,7 @@ TS_IP=$(tailscale ip -4 2>/dev/null || true)
 cat <<NOTES
 
 ============================================
-  Console Gateway Web - Installed  v1.1
+  Console Gateway Web - Installed  v1.2
 ============================================
 
   URL:       http://${LOCAL_IP:-localhost}:${CGW_PORT}
