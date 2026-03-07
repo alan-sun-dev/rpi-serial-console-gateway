@@ -4,11 +4,15 @@
 # Usage: sudo bash console-gateway-web-install.sh [--port 8080] [--password mypass]
 #
 # v1.2:
-#   - Feature: Network tab — iPhone USB Gateway integration
-#     - Live WAN/LAN status, IP, traffic stats from iphone-gw status file
-#     - Service health dashboard (iphone-gw, timer, dnsmasq, nftables)
-#     - Pair / Reconnect buttons (idevicepair + systemctl restart)
-#     - Graceful "not installed" state when iphone-gw is absent
+#   - Feature: Network tab — full network status + iPhone USB Gateway
+#     - Auto-detect: udev rules trigger gateway mode on iPhone plug/unplug
+#     - On plug: backup eth0, set eth0 as LAN (DHCP server), iPhone USB = WAN, NAT
+#     - On unplug: stop dnsmasq/NAT, restore eth0 original config (NM/dhcpcd/manual)
+#     - Network tab shows all interfaces, IPs, default route, mode indicator
+#     - Manual Enable/Disable gateway, Pair iPhone buttons
+#     - Installs: usbmuxd, libimobiledevice, nftables, dnsmasq (disabled by default)
+#     - Scripts: /usr/local/sbin/cgw-iphone-{up,down}
+#     - udev: /etc/udev/rules.d/99-cgw-iphone.rules
 #
 # v1.1 fixes:
 #   - Security: password hashing upgraded from bare SHA-256 to werkzeug pbkdf2 (salted)
@@ -75,8 +79,6 @@ apt-get install -y -qq python3-venv python3-dev > /dev/null
 log "Creating ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}/templates"
 
-# ====== Write app.py ======
-log "Writing app.py..."
 cat > "${INSTALL_DIR}/app.py" <<'APPEOF'
 #!/usr/bin/env python3
 """Console Gateway Web Management System"""
@@ -697,10 +699,10 @@ def api_settings_global_update():
     return jsonify({"ok": True, "message": "Global defaults updated."})
 
 
-# --------------- iPhone Gateway API ---------------
-IPHONE_GW_STATUS = "/run/iphone-gw.status"
-IPHONE_GW_SERVICE = "iphone-gw.service"
-IPHONE_GW_LOG = "/var/log/iphone-gw.log"
+# --------------- Network / iPhone Gateway API ---------------
+CGW_NETWORK_STATE = "/run/cgw-network.state"
+CGW_IPHONE_UP = "/usr/local/sbin/cgw-iphone-up"
+CGW_IPHONE_DOWN = "/usr/local/sbin/cgw-iphone-down"
 
 
 def _read_kv_file(path):
@@ -765,72 +767,161 @@ def _service_active(name):
         return False
 
 
-@app.route("/api/iphone/status")
+def _detect_usb_wan():
+    """Detect USB network interface (iPhone tethering)."""
+    try:
+        r = subprocess.run(
+            ["ip", "-o", "link", "show"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in r.stdout.strip().split("\n"):
+            parts = line.split(": ")
+            if len(parts) >= 2:
+                dev = parts[1].split("@")[0].strip()
+                if re.match(r'^(usb|enx|eth[1-9]|wwan)', dev):
+                    return dev
+    except Exception:
+        pass
+    return None
+
+
+def _list_interfaces():
+    """List all network interfaces with basic info."""
+    ifaces = []
+    try:
+        r = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True, text=True, timeout=5,
+        )
+        seen = set()
+        for line in r.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split()
+            # format: idx: dev inet x.x.x.x/prefix ...
+            dev = parts[1] if len(parts) > 1 else ""
+            if dev in seen or dev == "lo":
+                continue
+            seen.add(dev)
+            ip_addr = None
+            for i, p in enumerate(parts):
+                if p == "inet" and i + 1 < len(parts):
+                    ip_addr = parts[i + 1].split("/")[0]
+                    break
+            op = _sys_val(dev, "operstate")
+            ifaces.append({
+                "name": dev,
+                "ip": ip_addr,
+                "operstate": op,
+            })
+        # Also list interfaces without IP (link up but no addr)
+        r2 = subprocess.run(
+            ["ip", "-o", "link", "show"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in r2.stdout.strip().split("\n"):
+            lparts = line.split(": ")
+            if len(lparts) >= 2:
+                dev = lparts[1].split("@")[0].strip()
+                if dev not in seen and dev != "lo":
+                    seen.add(dev)
+                    op = _sys_val(dev, "operstate")
+                    ifaces.append({"name": dev, "ip": None, "operstate": op})
+    except Exception:
+        pass
+    return ifaces
+
+
+@app.route("/api/network/status")
 @login_required
-def api_iphone_status():
-    """iPhone USB Gateway status — reads status file + live sysfs data."""
-    installed = os.path.isfile("/usr/local/sbin/iphone-gw-up") or \
-                _service_active(IPHONE_GW_SERVICE)
+def api_network_status():
+    """Comprehensive network status: mode, interfaces, gateway details."""
+    gw_installed = os.path.isfile(CGW_IPHONE_UP)
 
-    if not installed:
-        return jsonify({
-            "installed": False,
-            "note": "iPhone Gateway is not installed. Run iphone-gw-install-v11.sh to set up.",
-        })
+    # Current mode from state file
+    state = _read_kv_file(CGW_NETWORK_STATE)
+    mode = state.get("mode", "normal")
+    wan_if = state.get("wan_if", "")
 
-    status = _read_kv_file(IPHONE_GW_STATUS)
-    wan = status.get("wan_if", "")
-    lan = status.get("lan_if", "eth0")
+    # Detect USB WAN interface (iPhone)
+    usb_wan = _detect_usb_wan()
 
-    # Live interface data
-    wan_op = _sys_val(wan, "operstate") if wan else "unknown"
-    wan_car = _sys_val(wan, "carrier") if wan else "0"
-    wan_ready = wan_op == "up" and wan_car == "1"
-    wan_ip = _iface_ip(wan) if wan else None
-    lan_ip = _iface_ip(lan) if lan else None
-    stats = _iface_stats(wan) if wan else {"rx_bytes": 0, "tx_bytes": 0}
+    # All interfaces
+    interfaces = _list_interfaces()
 
-    # Services
-    services = {
-        "iphone-gw": _service_active(IPHONE_GW_SERVICE),
-        "iphone-gw.timer": _service_active("iphone-gw.timer"),
-        "dnsmasq": _service_active("dnsmasq"),
-        "nftables": _service_active("nftables"),
-    }
+    # Default route
+    try:
+        r = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5,
+        )
+        default_route = r.stdout.strip().split("\n")[0] if r.stdout.strip() else ""
+    except Exception:
+        default_route = ""
 
-    # idevicepair status
-    pair_rc, pair_out, _ = run_cmd(["idevicepair", "validate"], timeout=5)
+    # iPhone pair status (only check if relevant)
+    paired = False
+    pair_msg = ""
+    if usb_wan or mode == "iphone-gw":
+        rc, out, _ = run_cmd(["idevicepair", "validate"], timeout=5)
+        paired = rc == 0
+        pair_msg = out.strip() if out else ""
 
-    # Traffic log (last 5 lines)
-    traffic_lines = []
-    if os.path.isfile(IPHONE_GW_LOG):
-        try:
-            r = subprocess.run(
-                ["tail", "-n", "5", IPHONE_GW_LOG],
-                capture_output=True, text=True, timeout=5,
-            )
-            traffic_lines = [l for l in r.stdout.strip().split("\n") if l]
-        except Exception:
-            pass
+    # Gateway mode details
+    gw_info = {}
+    if mode == "iphone-gw" and wan_if:
+        wan_ip = _iface_ip(wan_if)
+        wan_ready = _sys_val(wan_if, "operstate") == "up"
+        stats = _iface_stats(wan_if)
+        gw_info = {
+            "wan_if": wan_if,
+            "wan_ip": wan_ip,
+            "wan_ready": wan_ready,
+            "lan_ip": _iface_ip("eth0"),
+            "rx_bytes": stats["rx_bytes"],
+            "tx_bytes": stats["tx_bytes"],
+            "activated": state.get("activated", ""),
+        }
 
     return jsonify({
-        "installed": True,
-        "wan_if": wan or "none",
-        "lan_if": lan,
-        "wan_ip": wan_ip,
-        "lan_ip": lan_ip,
-        "wan_operstate": wan_op,
-        "wan_carrier": wan_car,
-        "wan_ready": wan_ready,
-        "rx_bytes": stats["rx_bytes"],
-        "tx_bytes": stats["tx_bytes"],
-        "services": services,
-        "paired": pair_rc == 0,
-        "pair_message": pair_out.strip() if pair_out else "",
-        "note": status.get("note", ""),
-        "updated": status.get("updated", ""),
-        "traffic_log": traffic_lines,
+        "mode": mode,
+        "gw_installed": gw_installed,
+        "iphone_detected": usb_wan is not None,
+        "usb_wan_if": usb_wan,
+        "iphone_paired": paired,
+        "pair_message": pair_msg,
+        "interfaces": interfaces,
+        "default_route": default_route,
+        "gateway": gw_info,
     })
+
+
+@app.route("/api/network/iphone-gw/enable", methods=["POST"])
+@login_required
+@csrf_required
+def api_iphone_gw_enable():
+    """Manually activate iPhone gateway mode."""
+    if not os.path.isfile(CGW_IPHONE_UP):
+        return jsonify({"error": "iPhone gateway scripts not installed"}), 400
+    rc, out, err = run_cmd([CGW_IPHONE_UP], timeout=30)
+    combined = (out + err).strip()
+    if rc == 0:
+        return jsonify({"ok": True, "message": combined or "iPhone gateway activated"})
+    return jsonify({"error": combined or "Activation failed"}), 500
+
+
+@app.route("/api/network/iphone-gw/disable", methods=["POST"])
+@login_required
+@csrf_required
+def api_iphone_gw_disable():
+    """Manually deactivate iPhone gateway mode."""
+    if not os.path.isfile(CGW_IPHONE_DOWN):
+        return jsonify({"error": "iPhone gateway scripts not installed"}), 400
+    rc, out, err = run_cmd([CGW_IPHONE_DOWN], timeout=30)
+    combined = (out + err).strip()
+    if rc == 0:
+        return jsonify({"ok": True, "message": combined or "iPhone gateway deactivated"})
+    return jsonify({"error": combined or "Deactivation failed"}), 500
 
 
 @app.route("/api/iphone/pair", methods=["POST"])
@@ -843,17 +934,6 @@ def api_iphone_pair():
     if rc == 0 or "SUCCESS" in combined.upper():
         return jsonify({"ok": True, "message": combined or "Paired successfully"})
     return jsonify({"ok": False, "error": combined or "Pair failed. Tap 'Trust' on iPhone."}), 400
-
-
-@app.route("/api/iphone/reconnect", methods=["POST"])
-@login_required
-@csrf_required
-def api_iphone_reconnect():
-    """Restart iPhone Gateway service to re-detect WAN."""
-    rc, out, err = run_cmd(["systemctl", "restart", IPHONE_GW_SERVICE], timeout=15)
-    if rc == 0:
-        return jsonify({"ok": True, "message": "Gateway service restarted"})
-    return jsonify({"error": (err or "restart failed").strip()}), 500
 
 
 # --------------- Tailscale API ---------------
@@ -1358,86 +1438,66 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
         </div>
       </div>
 
-      <!-- Network (iPhone Gateway) Tab -->
+      <!-- Network Tab -->
       <div class="tab-pane fade" id="tab-network">
-        <div id="iphone-not-installed" style="display:none">
-          <div class="card">
-            <div class="card-body text-center py-5">
-              <i class="bi bi-phone text-muted" style="font-size:3rem"></i>
-              <p class="mt-3 text-muted">iPhone USB Gateway is not installed.</p>
-              <p class="small text-muted">Run <code>iphone-gw-install-v11.sh</code> to enable iPhone USB tethering as WAN uplink.</p>
+        <!-- Mode Banner -->
+        <div class="card mb-3" id="net-mode-card">
+          <div class="card-body d-flex justify-content-between align-items-center py-2 px-3">
+            <div>
+              <span class="fw-bold" id="net-mode-label">Normal Mode</span>
+              <span class="text-muted small ms-2" id="net-mode-detail"></span>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <span class="small" id="net-iphone-detect"></span>
+              <button class="btn btn-sm btn-outline-light" onclick="refreshNetwork()"><i class="bi bi-arrow-clockwise"></i></button>
             </div>
           </div>
         </div>
-        <div id="iphone-installed" style="display:none">
-          <div class="row mb-3">
-            <!-- WAN Status -->
-            <div class="col-md-6">
-              <div class="card">
-                <div class="card-header d-flex justify-content-between align-items-center">
-                  <span><i class="bi bi-phone"></i> iPhone WAN</span>
-                  <div class="d-flex gap-2">
-                    <button class="btn btn-sm btn-outline-light" onclick="refreshIphone()"><i class="bi bi-arrow-clockwise"></i></button>
-                  </div>
-                </div>
-                <div class="card-body">
-                  <div id="iphone-note-banner" class="mb-3" style="display:none">
-                    <div style="padding:10px; background:rgba(222,0,46,0.15); border-left:4px solid var(--brand-red); border-radius:4px; color:#ffa8a8;">
-                      <small><i class="bi bi-exclamation-triangle"></i> <span id="iphone-note-text"></span></small>
-                    </div>
-                  </div>
-                  <table class="table table-sm mb-0">
-                    <tr>
-                      <td class="text-muted" style="width:130px">WAN Interface</td>
-                      <td><code id="iph-wan-if">-</code></td>
-                    </tr>
-                    <tr>
-                      <td class="text-muted">WAN IP</td>
-                      <td id="iph-wan-ip">-</td>
-                    </tr>
-                    <tr>
-                      <td class="text-muted">Link Status</td>
-                      <td id="iph-link-status">-</td>
-                    </tr>
-                    <tr>
-                      <td class="text-muted">Traffic (RX / TX)</td>
-                      <td id="iph-traffic">-</td>
-                    </tr>
-                    <tr>
-                      <td class="text-muted">LAN Interface</td>
-                      <td><code id="iph-lan-if">-</code></td>
-                    </tr>
-                    <tr>
-                      <td class="text-muted">LAN IP</td>
-                      <td id="iph-lan-ip">-</td>
-                    </tr>
-                    <tr>
-                      <td class="text-muted">iPhone Paired</td>
-                      <td id="iph-paired">-</td>
-                    </tr>
-                  </table>
-                  <div class="mt-3 d-flex gap-2">
-                    <button class="btn btn-sm btn-primary" onclick="iphonePair()"><i class="bi bi-link-45deg"></i> Pair iPhone</button>
-                    <button class="btn btn-sm btn-outline-light" onclick="iphoneReconnect()"><i class="bi bi-arrow-repeat"></i> Reconnect</button>
-                  </div>
-                  <div id="iph-action-msg" class="small mt-2" style="display:none"></div>
-                </div>
+        <div class="row">
+          <!-- Left: Interfaces + Routing -->
+          <div class="col-md-6">
+            <div class="card mb-3">
+              <div class="card-header"><i class="bi bi-ethernet"></i> Interfaces</div>
+              <div class="card-body p-0">
+                <table class="table table-sm table-hover mb-0">
+                  <thead><tr><th></th><th>Interface</th><th>IP Address</th><th>State</th></tr></thead>
+                  <tbody id="net-ifaces"></tbody>
+                </table>
               </div>
             </div>
-            <!-- Services & Traffic Log -->
-            <div class="col-md-6">
-              <div class="card mb-3">
-                <div class="card-header"><i class="bi bi-gear"></i> Gateway Services</div>
-                <div class="card-body">
-                  <table class="table table-sm mb-0">
-                    <tbody id="iph-services"></tbody>
-                  </table>
-                </div>
+            <div class="card mb-3">
+              <div class="card-header"><i class="bi bi-signpost-2"></i> Default Route</div>
+              <div class="card-body py-2">
+                <code id="net-default-route" class="small" style="color:var(--brand-cyan);">-</code>
               </div>
-              <div class="card">
-                <div class="card-header"><i class="bi bi-speedometer2"></i> Traffic Log (recent)</div>
-                <div class="card-body p-0">
-                  <pre id="iph-traffic-log" style="color:#c5c8ca; background:#0a0516; padding:12px; margin:0; font-size:.8rem; max-height:200px; overflow-y:auto; white-space:pre-wrap;"></pre>
+            </div>
+          </div>
+          <!-- Right: iPhone Gateway -->
+          <div class="col-md-6">
+            <div class="card mb-3">
+              <div class="card-header"><i class="bi bi-phone"></i> iPhone USB Gateway</div>
+              <div class="card-body">
+                <!-- Not installed warning -->
+                <div id="net-gw-not-installed" style="display:none">
+                  <p class="text-muted small mb-2"><i class="bi bi-info-circle"></i> iPhone gateway scripts not installed. Auto-detection disabled.</p>
+                  <p class="text-muted small mb-0">The installer will set up udev rules for auto plug/unplug detection.</p>
+                </div>
+                <!-- Gateway status (when installed) -->
+                <div id="net-gw-status" style="display:none">
+                  <table class="table table-sm mb-0">
+                    <tr><td class="text-muted" style="width:120px">iPhone</td><td id="net-gw-detected">-</td></tr>
+                    <tr><td class="text-muted">Paired</td><td id="net-gw-paired">-</td></tr>
+                    <tr id="net-gw-wan-row" style="display:none"><td class="text-muted">WAN</td><td id="net-gw-wan">-</td></tr>
+                    <tr id="net-gw-wanip-row" style="display:none"><td class="text-muted">WAN IP</td><td id="net-gw-wanip">-</td></tr>
+                    <tr id="net-gw-lanip-row" style="display:none"><td class="text-muted">LAN (eth0)</td><td id="net-gw-lanip">-</td></tr>
+                    <tr id="net-gw-traffic-row" style="display:none"><td class="text-muted">Traffic</td><td id="net-gw-traffic">-</td></tr>
+                  </table>
+                  <div class="mt-3 d-flex gap-2 flex-wrap">
+                    <button class="btn btn-sm btn-primary" id="btn-gw-pair" onclick="iphonePair()"><i class="bi bi-link-45deg"></i> Pair</button>
+                    <button class="btn btn-sm btn-outline-light" id="btn-gw-enable" onclick="iphoneGwEnable()" style="display:none"><i class="bi bi-power"></i> Enable Gateway</button>
+                    <button class="btn btn-sm btn-outline-danger" id="btn-gw-disable" onclick="iphoneGwDisable()" style="display:none"><i class="bi bi-stop-circle"></i> Disable Gateway</button>
+                  </div>
+                  <div id="net-gw-msg" class="small mt-2" style="display:none"></div>
                 </div>
               </div>
             </div>
@@ -2038,7 +2098,7 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
       refreshTailscale();
     });
 
-    // ---- iPhone Gateway ----
+    // ---- Network / iPhone Gateway ----
     function fmtBytes(b) {
       if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GB';
       if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
@@ -2046,117 +2106,143 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
       return b + ' B';
     }
 
-    async function refreshIphone() {
-      const d = await api('/api/iphone/status');
+    async function refreshNetwork() {
+      const d = await api('/api/network/status');
       if (!d) return;
 
-      const notInstalled = document.getElementById('iphone-not-installed');
-      const installed = document.getElementById('iphone-installed');
+      const modeLabel = document.getElementById('net-mode-label');
+      const modeDetail = document.getElementById('net-mode-detail');
+      const modeCard = document.getElementById('net-mode-card');
+      const detectEl = document.getElementById('net-iphone-detect');
 
-      if (!d.installed) {
+      // Mode banner
+      if (d.mode === 'iphone-gw') {
+        modeLabel.innerHTML = '<i class="bi bi-phone" style="color:var(--brand-accent)"></i> iPhone Gateway Mode';
+        modeDetail.textContent = 'WAN: ' + (d.gateway.wan_if || '?') + ' → LAN: eth0 (DHCP Server)';
+        modeCard.style.borderLeft = '4px solid var(--brand-accent)';
+      } else {
+        modeLabel.innerHTML = '<i class="bi bi-ethernet" style="color:var(--brand-green)"></i> Normal Mode';
+        modeDetail.textContent = '';
+        modeCard.style.borderLeft = '';
+      }
+
+      // iPhone detection indicator
+      if (d.iphone_detected) {
+        detectEl.innerHTML = '<span class="badge badge-running"><i class="bi bi-phone"></i> iPhone: ' + escapeHtml(d.usb_wan_if) + '</span>';
+      } else {
+        detectEl.innerHTML = '<span class="badge badge-stopped">No iPhone</span>';
+      }
+
+      // Interfaces table
+      const ifBody = document.getElementById('net-ifaces');
+      ifBody.innerHTML = '';
+      (d.interfaces || []).forEach(iface => {
+        const isUp = iface.operstate === 'up';
+        const dotClass = isUp ? 'ok' : 'down';
+        ifBody.innerHTML += `<tr>
+          <td><span class="status-dot ${dotClass}"></span></td>
+          <td><code>${escapeHtml(iface.name)}</code></td>
+          <td>${iface.ip ? '<code>' + escapeHtml(iface.ip) + '</code>' : '<span class="text-muted">-</span>'}</td>
+          <td><small class="text-muted">${escapeHtml(iface.operstate || 'unknown')}</small></td>
+        </tr>`;
+      });
+
+      // Default route
+      document.getElementById('net-default-route').textContent = d.default_route || '(none)';
+
+      // iPhone Gateway section
+      const notInstalled = document.getElementById('net-gw-not-installed');
+      const gwStatus = document.getElementById('net-gw-status');
+
+      if (!d.gw_installed) {
         notInstalled.style.display = '';
-        installed.style.display = 'none';
+        gwStatus.style.display = 'none';
         return;
       }
       notInstalled.style.display = 'none';
-      installed.style.display = '';
+      gwStatus.style.display = '';
 
-      // Note banner
-      const banner = document.getElementById('iphone-note-banner');
-      if (d.note && !d.note.startsWith('OK')) {
-        document.getElementById('iphone-note-text').textContent = d.note;
-        banner.style.display = '';
+      // Detected
+      const detectedEl = document.getElementById('net-gw-detected');
+      if (d.iphone_detected) {
+        detectedEl.innerHTML = `<span class="status-dot ok"></span>Detected (<code>${escapeHtml(d.usb_wan_if)}</code>)`;
       } else {
-        banner.style.display = 'none';
+        detectedEl.innerHTML = '<span class="status-dot down"></span>Not connected';
       }
-
-      // WAN info
-      document.getElementById('iph-wan-if').textContent = d.wan_if || 'none';
-      const wanIpEl = document.getElementById('iph-wan-ip');
-      if (d.wan_ip) {
-        wanIpEl.innerHTML = `<code class="text-success">${escapeHtml(d.wan_ip)}</code>`;
-      } else {
-        wanIpEl.innerHTML = '<span class="text-danger">Disconnected</span>';
-      }
-
-      // Link
-      const linkEl = document.getElementById('iph-link-status');
-      if (d.wan_ready) {
-        linkEl.innerHTML = '<span class="status-dot ok"></span>Up';
-      } else {
-        linkEl.innerHTML = `<span class="status-dot down"></span>${escapeHtml(d.wan_operstate || 'unknown')} / carrier: ${escapeHtml(d.wan_carrier || '0')}`;
-      }
-
-      // Traffic
-      document.getElementById('iph-traffic').textContent =
-        fmtBytes(d.rx_bytes || 0) + ' / ' + fmtBytes(d.tx_bytes || 0);
-
-      // LAN
-      document.getElementById('iph-lan-if').textContent = d.lan_if || '-';
-      document.getElementById('iph-lan-ip').innerHTML = d.lan_ip
-        ? `<code>${escapeHtml(d.lan_ip)}</code>` : '-';
 
       // Paired
-      const pairedEl = document.getElementById('iph-paired');
-      if (d.paired) {
+      const pairedEl = document.getElementById('net-gw-paired');
+      if (d.iphone_paired) {
         pairedEl.innerHTML = '<span class="badge badge-running">Yes</span>';
       } else {
         pairedEl.innerHTML = '<span class="badge badge-stopped">No</span>';
       }
 
-      // Services
-      const svcBody = document.getElementById('iph-services');
-      svcBody.innerHTML = '';
-      const svcNames = { 'iphone-gw': 'Gateway', 'iphone-gw.timer': 'Health Timer', 'dnsmasq': 'DHCP/DNS', 'nftables': 'Firewall' };
-      for (const [key, label] of Object.entries(svcNames)) {
-        const active = d.services && d.services[key];
-        svcBody.innerHTML += `<tr>
-          <td class="text-muted">${escapeHtml(label)}</td>
-          <td><span class="status-dot ${active ? 'ok' : 'down'}"></span>${active ? 'Active' : 'Inactive'}</td>
-        </tr>`;
-      }
+      // Gateway mode details
+      const gwRows = ['wan', 'wanip', 'lanip', 'traffic'];
+      const btnEnable = document.getElementById('btn-gw-enable');
+      const btnDisable = document.getElementById('btn-gw-disable');
 
-      // Traffic log
-      const logEl = document.getElementById('iph-traffic-log');
-      logEl.textContent = (d.traffic_log || []).join('\n') || '(no traffic data)';
+      if (d.mode === 'iphone-gw' && d.gateway) {
+        const gw = d.gateway;
+        document.getElementById('net-gw-wan').innerHTML = `<code>${escapeHtml(gw.wan_if || '-')}</code> ${gw.wan_ready ? '<span class="status-dot ok"></span>' : '<span class="status-dot down"></span>'}`;
+        document.getElementById('net-gw-wanip').innerHTML = gw.wan_ip ? `<code class="text-success">${escapeHtml(gw.wan_ip)}</code>` : '<span class="text-danger">No IP</span>';
+        document.getElementById('net-gw-lanip').innerHTML = gw.lan_ip ? `<code>${escapeHtml(gw.lan_ip)}</code> <small class="text-muted">(DHCP Server)</small>` : '-';
+        document.getElementById('net-gw-traffic').textContent = fmtBytes(gw.rx_bytes || 0) + ' RX / ' + fmtBytes(gw.tx_bytes || 0) + ' TX';
+        gwRows.forEach(r => document.getElementById('net-gw-' + r + '-row').style.display = '');
+        btnEnable.style.display = 'none';
+        btnDisable.style.display = '';
+      } else {
+        gwRows.forEach(r => document.getElementById('net-gw-' + r + '-row').style.display = 'none');
+        btnEnable.style.display = d.iphone_detected ? '' : 'none';
+        btnDisable.style.display = 'none';
+      }
+    }
+
+    function gwMsg(text, cls) {
+      const msg = document.getElementById('net-gw-msg');
+      msg.textContent = text;
+      msg.className = 'small mt-2 ' + cls;
+      msg.style.display = '';
+      setTimeout(() => msg.style.display = 'none', 5000);
     }
 
     async function iphonePair() {
-      const msg = document.getElementById('iph-action-msg');
-      msg.textContent = 'Pairing... Tap "Trust" on your iPhone screen.';
-      msg.className = 'small mt-2 text-warning';
-      msg.style.display = '';
+      gwMsg('Pairing... Tap "Trust" on your iPhone.', 'text-warning');
       const r = await api('/api/iphone/pair', 'POST');
       if (r && r.ok) {
-        msg.textContent = r.message || 'Paired!';
-        msg.className = 'small mt-2 text-success';
-        setTimeout(refreshIphone, 1500);
+        gwMsg(r.message || 'Paired!', 'text-success');
+        setTimeout(refreshNetwork, 1500);
       } else {
-        msg.textContent = (r && r.error) || 'Pair failed';
-        msg.className = 'small mt-2 text-danger';
+        gwMsg((r && r.error) || 'Pair failed', 'text-danger');
       }
-      setTimeout(() => msg.style.display = 'none', 5000);
     }
 
-    async function iphoneReconnect() {
-      const msg = document.getElementById('iph-action-msg');
-      msg.textContent = 'Restarting gateway service...';
-      msg.className = 'small mt-2 text-warning';
-      msg.style.display = '';
-      const r = await api('/api/iphone/reconnect', 'POST');
+    async function iphoneGwEnable() {
+      gwMsg('Activating iPhone gateway mode...', 'text-warning');
+      const r = await api('/api/network/iphone-gw/enable', 'POST');
       if (r && r.ok) {
-        msg.textContent = r.message || 'Reconnected!';
-        msg.className = 'small mt-2 text-success';
-        setTimeout(refreshIphone, 2000);
+        gwMsg(r.message || 'Activated!', 'text-success');
+        setTimeout(refreshNetwork, 2000);
       } else {
-        msg.textContent = (r && r.error) || 'Reconnect failed';
-        msg.className = 'small mt-2 text-danger';
+        gwMsg((r && r.error) || 'Activation failed', 'text-danger');
       }
-      setTimeout(() => msg.style.display = 'none', 5000);
+    }
+
+    async function iphoneGwDisable() {
+      if (!confirm('Disable iPhone gateway and restore eth0?')) return;
+      gwMsg('Deactivating...', 'text-warning');
+      const r = await api('/api/network/iphone-gw/disable', 'POST');
+      if (r && r.ok) {
+        gwMsg(r.message || 'Deactivated!', 'text-success');
+        setTimeout(refreshNetwork, 2000);
+      } else {
+        gwMsg((r && r.error) || 'Deactivation failed', 'text-danger');
+      }
     }
 
     document.querySelector('a[href="#tab-network"]').addEventListener('shown.bs.tab', () => {
-      refreshIphone();
+      refreshNetwork();
     });
 
     // ---- Settings ----
@@ -2260,6 +2346,266 @@ cat > "${INSTALL_DIR}/templates/dashboard.html" <<'DASHEOF'
 </body>
 </html>
 DASHEOF
+
+# ====== Install iPhone Gateway scripts ======
+log "Installing iPhone USB Gateway auto-detect scripts..."
+cat > /usr/local/sbin/cgw-iphone-up <<'IPHONEUP_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# Console Gateway - iPhone USB Gateway Activation
+# Called by udev (on iPhone USB plug-in) or manually via Web UI.
+#
+# Actions:
+#   1. Detect iPhone USB network interface (usb0/enx*/eth1)
+#   2. Backup current eth0 configuration
+#   3. Reconfigure eth0 as LAN (192.168.88.1/24, DHCP server)
+#   4. Enable IP forwarding + nftables NAT
+#   5. iPhone USB becomes WAN uplink
+# ==============================================================================
+
+STATE_FILE="/run/cgw-network.state"
+DNSMASQ_CONF="/run/cgw-iphone-dnsmasq.conf"
+DNSMASQ_PID="/run/cgw-iphone-dnsmasq.pid"
+NFT_TABLE="cgw_iphone_gw"
+NFT_NAT_TABLE="cgw_iphone_nat"
+LOCK_FILE="/var/lock/cgw-iphone.lock"
+
+LAN_IF="eth0"
+LAN_IP="192.168.88.1"
+LAN_CIDR="192.168.88.1/24"
+LAN_NET="192.168.88.0/24"
+DHCP_START="192.168.88.50"
+DHCP_END="192.168.88.200"
+DHCP_LEASE="12h"
+
+log() {
+  echo "[cgw-iphone] $*" >&2
+  logger -t cgw-iphone "$*" 2>/dev/null || true
+}
+
+# Acquire lock
+exec 200>"${LOCK_FILE}"
+if ! flock -n 200; then
+  log "Another instance running, exiting"
+  exit 0
+fi
+
+# Already in gateway mode?
+if [[ -f "${STATE_FILE}" ]] && grep -q "mode=iphone-gw" "${STATE_FILE}"; then
+  log "Already in iPhone gateway mode"
+  exit 0
+fi
+
+# Detect USB WAN interface
+detect_wan() {
+  local dev
+  for dev in $(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(usb|enx|eth[1-9]|wwan)' || true); do
+    [[ "${dev}" == "${LAN_IF}" || "${dev}" == "lo" ]] && continue
+    echo "${dev}"
+    return 0
+  done
+  echo ""
+}
+
+WAN_IF="$(detect_wan)"
+if [[ -z "${WAN_IF}" ]]; then
+  log "No USB WAN interface found"
+  exit 0
+fi
+
+log "Activating: WAN=${WAN_IF} -> LAN=${LAN_IF}"
+
+# Bring up WAN
+ip link set "${WAN_IF}" up 2>/dev/null || true
+
+# Try to pair iPhone (non-blocking)
+idevicepair pair 2>/dev/null || true
+
+# Wait for carrier (up to 15s)
+for i in $(seq 1 15); do
+  carrier=$(cat "/sys/class/net/${WAN_IF}/carrier" 2>/dev/null || echo "0")
+  [[ "${carrier}" == "1" ]] && break
+  sleep 1
+done
+
+# Check WAN got an IP via DHCP (some iPhones need this)
+if ! ip -4 addr show "${WAN_IF}" | grep -q "inet "; then
+  dhclient -1 -v "${WAN_IF}" 2>/dev/null || true
+  sleep 2
+fi
+
+# Save current eth0 state before modifying
+eth0_prev_addrs="$(ip -4 addr show "${LAN_IF}" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -5 | tr '\n' ',' || true)"
+eth0_prev_gw="$(ip route show default dev "${LAN_IF}" 2>/dev/null | awk '{print $3}' | head -1 || true)"
+
+{
+  echo "mode=iphone-gw"
+  echo "wan_if=${WAN_IF}"
+  echo "activated=$(date +%s)"
+  echo "eth0_prev_addrs=${eth0_prev_addrs}"
+  echo "eth0_prev_gw=${eth0_prev_gw}"
+} > "${STATE_FILE}"
+
+# Reconfigure eth0 as LAN
+# First, tell NetworkManager to leave eth0 alone (if NM is running)
+if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+  nmcli device set "${LAN_IF}" managed no 2>/dev/null || true
+fi
+
+ip addr flush dev "${LAN_IF}" 2>/dev/null || true
+ip addr add "${LAN_CIDR}" dev "${LAN_IF}" 2>/dev/null || true
+ip link set "${LAN_IF}" up
+
+# Enable IP forwarding
+sysctl -w net.ipv4.ip_forward=1 > /dev/null
+
+# Start dnsmasq for LAN DHCP (separate instance)
+cat > "${DNSMASQ_CONF}" <<DNSMASQ
+# Console Gateway - iPhone Gateway DHCP
+interface=${LAN_IF}
+bind-interfaces
+dhcp-range=${DHCP_START},${DHCP_END},${DHCP_LEASE}
+domain-needed
+bogus-priv
+no-resolv
+server=8.8.8.8
+server=1.1.1.1
+DNSMASQ
+
+# Kill any previous cgw dnsmasq
+if [[ -f "${DNSMASQ_PID}" ]]; then
+  kill "$(cat "${DNSMASQ_PID}")" 2>/dev/null || true
+  rm -f "${DNSMASQ_PID}"
+fi
+sleep 0.3
+
+dnsmasq --conf-file="${DNSMASQ_CONF}" --pid-file="${DNSMASQ_PID}" --log-facility=/var/log/cgw-iphone-dnsmasq.log 2>&1 || {
+  log "WARNING: dnsmasq failed to start (port 53 conflict?)"
+}
+
+# Setup nftables NAT
+nft add table inet "${NFT_TABLE}" 2>/dev/null || true
+nft flush table inet "${NFT_TABLE}" 2>/dev/null || true
+nft add table ip "${NFT_NAT_TABLE}" 2>/dev/null || true
+nft flush table ip "${NFT_NAT_TABLE}" 2>/dev/null || true
+
+nft add chain inet "${NFT_TABLE}" forward '{ type filter hook forward priority 20; policy accept; }'
+nft add rule inet "${NFT_TABLE}" forward iifname "${LAN_IF}" oifname "${WAN_IF}" ip saddr "${LAN_NET}" counter accept
+nft add rule inet "${NFT_TABLE}" forward iifname "${WAN_IF}" oifname "${LAN_IF}" ct state related,established counter accept
+
+nft add chain ip "${NFT_NAT_TABLE}" postrouting '{ type nat hook postrouting priority 100; policy accept; }'
+nft add rule ip "${NFT_NAT_TABLE}" postrouting oifname "${WAN_IF}" ip saddr "${LAN_NET}" counter masquerade
+
+log "iPhone gateway activated: ${WAN_IF} -> ${LAN_IF} (${LAN_NET})"
+IPHONEUP_EOF
+chmod +x /usr/local/sbin/cgw-iphone-up
+
+cat > /usr/local/sbin/cgw-iphone-down <<'IPHONEDN_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# Console Gateway - iPhone USB Gateway Deactivation
+# Called by udev (on iPhone USB unplug) or manually via Web UI.
+#
+# Actions:
+#   1. Stop dnsmasq DHCP server
+#   2. Remove nftables NAT rules
+#   3. Restore eth0 to its previous configuration
+# ==============================================================================
+
+STATE_FILE="/run/cgw-network.state"
+DNSMASQ_PID="/run/cgw-iphone-dnsmasq.pid"
+DNSMASQ_CONF="/run/cgw-iphone-dnsmasq.conf"
+NFT_TABLE="cgw_iphone_gw"
+NFT_NAT_TABLE="cgw_iphone_nat"
+LAN_IF="eth0"
+
+log() {
+  echo "[cgw-iphone] $*" >&2
+  logger -t cgw-iphone "$*" 2>/dev/null || true
+}
+
+# Not in gateway mode — nothing to do
+if [[ ! -f "${STATE_FILE}" ]] || ! grep -q "mode=iphone-gw" "${STATE_FILE}"; then
+  exit 0
+fi
+
+log "Deactivating iPhone gateway mode"
+
+# Read saved state
+eth0_prev_addrs="$(grep 'eth0_prev_addrs=' "${STATE_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+eth0_prev_gw="$(grep 'eth0_prev_gw=' "${STATE_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+
+# 1. Stop dnsmasq
+if [[ -f "${DNSMASQ_PID}" ]]; then
+  kill "$(cat "${DNSMASQ_PID}")" 2>/dev/null || true
+  rm -f "${DNSMASQ_PID}"
+fi
+rm -f "${DNSMASQ_CONF}"
+
+# 2. Remove nftables rules
+nft delete table inet "${NFT_TABLE}" 2>/dev/null || true
+nft delete table ip "${NFT_NAT_TABLE}" 2>/dev/null || true
+
+# 3. Remove state file (before restoring, so mode=normal)
+rm -f "${STATE_FILE}"
+
+# 4. Restore eth0
+ip addr flush dev "${LAN_IF}" 2>/dev/null || true
+
+# Try NetworkManager first (modern Pi OS default)
+if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+  nmcli device set "${LAN_IF}" managed yes 2>/dev/null || true
+  # Give NM a moment to reclaim eth0 and get DHCP
+  nmcli device connect "${LAN_IF}" 2>/dev/null || true
+  log "eth0 returned to NetworkManager"
+
+elif systemctl is-active --quiet dhcpcd 2>/dev/null; then
+  # dhcpcd-based systems
+  systemctl restart dhcpcd 2>/dev/null || true
+  log "eth0 returned to dhcpcd"
+
+else
+  # Manual restore from saved state
+  if [[ -n "${eth0_prev_addrs}" ]]; then
+    IFS=',' read -ra addrs <<< "${eth0_prev_addrs}"
+    for addr in "${addrs[@]}"; do
+      [[ -n "${addr}" ]] && ip addr add "${addr}" dev "${LAN_IF}" 2>/dev/null || true
+    done
+    if [[ -n "${eth0_prev_gw}" ]]; then
+      ip route add default via "${eth0_prev_gw}" dev "${LAN_IF}" 2>/dev/null || true
+    fi
+    log "eth0 restored manually: ${eth0_prev_addrs}"
+  else
+    # Last resort: try DHCP
+    dhclient -1 "${LAN_IF}" 2>/dev/null || true
+    log "eth0 restored via dhclient"
+  fi
+fi
+
+ip link set "${LAN_IF}" up 2>/dev/null || true
+
+log "iPhone gateway deactivated, eth0 restored"
+IPHONEDN_EOF
+chmod +x /usr/local/sbin/cgw-iphone-down
+
+# udev rules for iPhone auto-detect
+cat > /etc/udev/rules.d/99-cgw-iphone.rules <<'UDEV_EOF'
+# Console Gateway - iPhone USB auto-detect
+ACTION=="add",    SUBSYSTEM=="net", ENV{ID_BUS}=="usb", KERNEL!="cgw-*", RUN+="/usr/local/sbin/cgw-iphone-up"
+ACTION=="remove", SUBSYSTEM=="net", ENV{ID_BUS}=="usb", KERNEL!="cgw-*", RUN+="/usr/local/sbin/cgw-iphone-down"
+UDEV_EOF
+udevadm control --reload-rules
+
+# Install required packages for iPhone tethering
+apt-get install -y -qq usbmuxd libimobiledevice-utils nftables dnsmasq > /dev/null 2>&1 || true
+# Disable system dnsmasq (we use a separate instance in gateway mode only)
+systemctl disable dnsmasq 2>/dev/null || true
+systemctl stop dnsmasq 2>/dev/null || true
+log "iPhone gateway auto-detect ready"
 # ====== Create Python venv ======
 log "Setting up Python virtual environment..."
 if [[ ! -d "${INSTALL_DIR}/venv" ]]; then
@@ -2305,6 +2651,11 @@ read -rp "Uninstall Console Gateway Web? (yes/N): " a
 systemctl stop ${SERVICE_NAME} 2>/dev/null || true
 systemctl disable ${SERVICE_NAME} 2>/dev/null || true
 rm -f /etc/systemd/system/${SERVICE_NAME}.service
+# Clean up iPhone gateway
+/usr/local/sbin/cgw-iphone-down 2>/dev/null || true
+rm -f /usr/local/sbin/cgw-iphone-up /usr/local/sbin/cgw-iphone-down
+rm -f /etc/udev/rules.d/99-cgw-iphone.rules
+udevadm control --reload-rules 2>/dev/null || true
 systemctl daemon-reload
 rm -rf ${INSTALL_DIR}
 echo "Console Gateway Web uninstalled."
@@ -2343,6 +2694,12 @@ ${TS_IP:+  Tailscale: http://${TS_IP}:${CGW_PORT}}
   Service:   sudo systemctl {start|stop|restart|status} ${SERVICE_NAME}
   Logs:      sudo journalctl -u ${SERVICE_NAME} -f
   Uninstall: sudo ${INSTALL_DIR}/uninstall.sh
+
+  iPhone USB Gateway:
+    Auto-detect is enabled via udev rules.
+    Plug iPhone USB + enable Personal Hotspot -> gateway mode activates.
+    Unplug iPhone -> eth0 config restored automatically.
+    Manual control available in Web UI > Network tab.
 
   Change password:
     NEW_HASH=\$(${INSTALL_DIR}/venv/bin/python3 -c \\
