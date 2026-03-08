@@ -51,6 +51,7 @@ Multi-port exclusive console server for Raspberry Pi — remote access to Cisco/
 - **systemd managed** — template units with per-device drop-in overrides
 - **One-command uninstall** — clean removal of all components
 - **Web management UI** — optional browser-based dashboard with web terminal, port management, Tailscale control, and session logs
+- **iPhone USB gateway** — plug iPhone USB for out-of-band internet; auto-detect switches eth0 to DHCP server + NAT, unplug restores original config
 
 ## Requirements
 
@@ -312,6 +313,16 @@ sudo ufw status verbose
 ├── cgw-SW-CORE-01 -> ttyUSB0    # persistent symlink (udev-managed)
 └── cgw-RTR-WAN-01 -> ttyUSB1    # persistent symlink (udev-managed)
 
+/usr/local/sbin/
+├── cgw-iphone-up                  # iPhone gateway activate (udev/manual)
+└── cgw-iphone-down                # iPhone gateway deactivate (udev/manual)
+
+/etc/udev/rules.d/
+└── 99-cgw-iphone.rules            # auto-detect iPhone USB plug/unplug
+
+/run/
+└── cgw-network.state              # current network mode (normal/iphone-gw)
+
 /opt/console-gateway-web/          # (optional) web management UI
 ├── app.py                         # Flask + SocketIO application
 ├── venv/                          # Python virtual environment
@@ -347,20 +358,21 @@ A browser-based management interface is available as an optional add-on. Install
 - **Dashboard** — real-time port status (running/stopped/busy), SSH & Tailscale health overview
 - **Web Terminal** — connect to serial consoles directly from the browser (xterm.js + WebSocket)
 - **Port Management** — start/stop/restart/kick/unlock ports, edit aliases — all from the UI
+- **Network / iPhone Gateway** — interface status, iPhone USB auto-detect, gateway mode control
 - **Tailscale Management** — connect/disconnect, view peers, ping, QR code for mobile authentication
 - **Session Log** — browse connection history
+- **Settings** — per-port baud/timeout overrides, global defaults
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Browser  http://<pi-ip>:8080                           │
-│  ┌─────┐ ┌──────────┐ ┌───────────┐ ┌─────────────┐    │
-│  │Ports│ │ Terminal  │ │ Tailscale │ │ Session Log │    │
-│  └──┬──┘ └────┬─────┘ └─────┬─────┘ └──────┬──────┘    │
-│     │         │              │              │           │
-│     ▼         ▼              ▼              ▼           │
-│  map.tsv   WebSocket     tailscale      sessions.log   │
-│  systemctl  :200x         CLI            tail          │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Browser  http://<pi-ip>:8080                                    │
+│  ┌─────┐ ┌──────────┐ ┌─────────┐ ┌───────────┐ ┌────┐ ┌────┐  │
+│  │Ports│ │ Terminal  │ │ Network │ │ Tailscale │ │Logs│ │Cfg │  │
+│  └──┬──┘ └────┬─────┘ └────┬────┘ └─────┬─────┘ └──┬─┘ └──┬─┘  │
+│     ▼         ▼            ▼             ▼          ▼      ▼    │
+│  map.tsv   WebSocket   iphone-gw     tailscale   log   settings │
+│  systemctl  :200x      udev/NAT      CLI         tail  drop-in │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Install Web UI
@@ -393,9 +405,12 @@ sudo systemctl status console-gateway-web    # check status
 sudo systemctl restart console-gateway-web   # restart
 sudo systemctl stop console-gateway-web      # stop
 
-# Change password
+# Change password (generates werkzeug pbkdf2 salted hash)
+NEW_HASH=$(/opt/console-gateway-web/venv/bin/python3 -c \
+  "from werkzeug.security import generate_password_hash; \
+   import getpass; print(generate_password_hash(getpass.getpass()))")
 sudo systemctl edit console-gateway-web
-# Add: Environment=CGW_ADMIN_PASS_HASH=<sha256-hex>
+# Add: Environment=CGW_ADMIN_PASS_HASH=<paste hash>
 sudo systemctl restart console-gateway-web
 
 # Uninstall
@@ -406,8 +421,82 @@ sudo /opt/console-gateway-web/uninstall.sh
 
 - **Backend:** Python Flask + Flask-SocketIO (eventlet)
 - **Frontend:** Bootstrap 5 + xterm.js + socket.io + qrcode-generator
-- **Auth:** SHA-256 password hash, session-based login
+- **Auth:** werkzeug pbkdf2 password hash, session-based login, CSRF token protection
 - **Install:** Python venv in `/opt/console-gateway-web/`, systemd managed
+
+## iPhone USB Gateway (Out-of-Band)
+
+When working at remote sites without reliable network access, you can use an iPhone as an out-of-band internet uplink via USB tethering. The web installer sets up **automatic plug/unplug detection** — no manual configuration needed.
+
+### How It Works
+
+```
+iPhone plugged in (USB)                    iPhone unplugged
+        │                                         │
+   udev trigger                               udev trigger
+        │                                         │
+   cgw-iphone-up                            cgw-iphone-down
+        │                                         │
+   ┌────▼─────────────────────┐          ┌────────▼──────────────┐
+   │ 1. Detect usb0/enx*     │          │ 1. Stop dnsmasq       │
+   │ 2. Backup eth0 config   │          │ 2. Remove NAT rules   │
+   │ 3. idevicepair pair     │          │ 3. Restore eth0       │
+   │ 4. eth0 → 192.168.88.1  │          │    (NM / dhcpcd /     │
+   │    DHCP server active   │          │     manual fallback)  │
+   │ 5. nftables NAT         │          └───────────────────────┘
+   │    iPhone USB = WAN     │
+   └─────────────────────────┘
+
+   Mode: iPhone Gateway                  Mode: Normal
+   eth0: 192.168.88.1 (LAN/DHCP)         eth0: original config
+   usb0: iPhone hotspot (WAN)             usb0: (gone)
+   Other devices on eth0 get internet     Tailscale reconnects via eth0/WiFi
+```
+
+### Usage
+
+1. **Connect iPhone** to Pi via USB cable
+2. **Enable Personal Hotspot** on iPhone (Settings > Personal Hotspot)
+3. **First time only:** tap "Trust This Computer" on iPhone
+4. Gateway mode activates automatically — eth0 becomes a DHCP server (192.168.88.0/24), other devices on eth0 get internet via iPhone
+5. **Unplug iPhone** — eth0 reverts to its previous config automatically
+
+### Network Modes
+
+| Mode | WAN (Internet) | eth0 Role | Use Case |
+|------|---------------|-----------|----------|
+| Normal (DHCP) | eth0 via site network | DHCP client | Site has working network |
+| Normal (WiFi) | wlan0 | DHCP client or unused | Use Pi's WiFi for internet |
+| iPhone Gateway | iPhone USB (usb0) | **DHCP server** (192.168.88.0/24) | Out-of-band / no site network |
+
+### Web UI Control
+
+The **Network** tab in the web UI shows:
+- Current mode indicator (Normal / iPhone Gateway)
+- All network interfaces with IPs and link state
+- Default route
+- iPhone detection and pairing status
+- Manual **Enable Gateway** / **Disable Gateway** / **Pair iPhone** buttons
+
+### Troubleshooting iPhone Gateway
+
+```bash
+# Check current mode
+cat /run/cgw-network.state
+
+# Watch auto-detect logs
+journalctl -t cgw-iphone -f
+
+# Manual activate/deactivate
+sudo /usr/local/sbin/cgw-iphone-up
+sudo /usr/local/sbin/cgw-iphone-down
+
+# Check iPhone pairing
+idevicepair validate
+
+# Check if udev rules are loaded
+udevadm info /sys/class/net/usb0    # when iPhone is plugged in
+```
 
 ## Uninstall
 
