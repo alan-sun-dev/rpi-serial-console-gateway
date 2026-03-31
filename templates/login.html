@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Console Gateway - Login</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              primary:   '#4D148C',
+              highlight: '#7D22C3',
+              accent:    '#FF6200',
+              blue:      '#007AB7',
+              bg:        '#1C0B2E',
+              bgmid:     '#2A1148',
+            }
+          },
+          backdropBlur: {
+            card: '10px',
+          },
+          fontFamily: {
+            ui: ["'Segoe UI'", 'system-ui', '-apple-system', 'sans-serif'],
+          },
+          boxShadow: {
+            focus: '0 0 0 0.2rem rgba(0, 122, 183, 0.25)',
+          },
+        }
+      }
+    }
+  </script>
+  <style type="text/tailwindcss">
+    /* Tailwind can't generate arbitrary rgba() values for background or border-color
+       used on dynamic pseudo-states, so we define a small set of helpers here. */
+    .input-field {
+      background: rgba(28, 11, 46, 0.8);
+      border-color: rgba(77, 20, 140, 0.5);
+      @apply w-full rounded-lg border px-[0.9rem] py-[0.6rem] text-white
+             text-sm outline-none transition-all duration-150;
+    }
+    .input-field:focus {
+      background: rgba(28, 11, 46, 0.9);
+      border-color: #007AB7;
+      box-shadow: 0 0 0 0.2rem rgba(0, 122, 183, 0.25);
+    }
+    .card {
+      background: rgba(77, 20, 140, 0.15);
+      border: 1px solid rgba(77, 20, 140, 0.4);
+      backdrop-filter: blur(10px);
+      @apply w-[400px] rounded-xl p-10;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center font-ui"
+      style="background: linear-gradient(135deg, #1C0B2E 0%, #2A1148 50%, #1C0B2E 100%);">
+
+  <div class="card">
+
+    <!-- Title -->
+    <h4 class="text-center text-white text-xl font-bold tracking-tight mb-2">
+      Console Gateway
+    </h4>
+
+    <!-- Gradient accent bar -->
+    <span class="block w-[60px] h-1 rounded-sm mx-auto mb-6"
+          style="background: linear-gradient(90deg, #4D148C, #7D22C3, #FF6200);"></span>
+
+    <!-- Error block -->
+    {% if error %}
+    <div class="mb-4 rounded-md border px-4 py-2 text-sm"
+         style="background: rgba(222, 0, 46, 0.15); border-color: #DE002E; color: #ff6b85;">
+      {{ error }}
+    </div>
+    {% endif %}
+
+    <form method="POST">
+
+      <!-- Username -->
+      <div class="mb-4">
+        <label class="block mb-1 text-[#B0A0C0] text-[0.9rem]">Username</label>
+        <input type="text" name="username" class="input-field" autofocus required>
+      </div>
+
+      <!-- Password -->
+      <div class="mb-6">
+        <label class="block mb-1 text-[#B0A0C0] text-[0.9rem]">Password</label>
+        <input type="password" name="password" class="input-field" required>
+      </div>
+
+      <!-- Submit -->
+      <button type="submit"
+              class="w-full rounded-lg py-[0.6rem] font-semibold text-white transition-all duration-200
+                     bg-brand-primary border border-brand-primary
+                     hover:bg-brand-highlight hover:border-brand-highlight">
+        Login
+      </button>
+
+    </form>
+  </div>
+
+</body>
+</html>

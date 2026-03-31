@@ -1,0 +1,1294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Console Gateway</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary:     '#4D148C',
+            highlight:   '#7D22C3',
+            accent:      '#FF6200',
+            brand: {
+              blue:      '#007AB7',
+              cyan:      '#0CC0DF',
+              green:     '#008A00',
+              red:       '#DE002E',
+              yellow:    '#F7B118',
+              tint:      '#825BAF',
+            },
+            'bg-dark':   '#1C0B2E',
+            'bg-card':   '#2A1148',
+            'border-c':  'rgba(77,20,140,0.45)',
+            'border-s':  '#4D148C',
+            'text-muted-c': '#B0A0C0',
+            'text-label': '#9080A8',
+          },
+          fontFamily: {
+            sans: ["'Segoe UI'", 'system-ui', '-apple-system', 'sans-serif'],
+            mono: ["'JetBrains Mono'", "'Fira Code'", "'Cascadia Code'", 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <link href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" rel="stylesheet">
+  <style>
+    /* Custom scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #1C0B2E; }
+    ::-webkit-scrollbar-thumb { background: #4D148C; border-radius: 3px; }
+
+    /* Status dot */
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; flex-shrink: 0; }
+    .status-dot.ok   { background: #008A00; }
+    .status-dot.down { background: #DE002E; }
+
+    /* Port status badges */
+    .badge-running   { background: #008A00; color: #fff; padding: 2px 8px; border-radius: 9999px; font-size: .75rem; font-weight: 600; }
+    .badge-stopped   { background: #565656; color: #fff; padding: 2px 8px; border-radius: 9999px; font-size: .75rem; font-weight: 600; }
+    .badge-busy      { background: #F7B118; color: #1C0B2E; padding: 2px 8px; border-radius: 9999px; font-size: .75rem; font-weight: 600; }
+    .badge-no-device { background: #DE002E; color: #fff; padding: 2px 8px; border-radius: 9999px; font-size: .75rem; font-weight: 600; }
+
+    /* Terminal */
+    #terminal-container { height: 420px; background: #0a0516; border-radius: 0 0 6px 6px; overflow: hidden; }
+
+    /* Session log */
+    #session-log { max-height: 300px; overflow-y: auto; background: rgba(28,11,46,0.8); border-radius: 6px; padding: 12px; font-family: monospace; font-size: .85rem; color: #d0c8e0; }
+    #session-log .line { padding: 2px 0; }
+
+    /* Tab panes */
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    /* Dark form elements */
+    .dark-input {
+      background: #1C0B2E;
+      color: #fff;
+      border: 1px solid #4D148C;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: .85rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .dark-input:focus { border-color: #007AB7; box-shadow: 0 0 0 2px rgba(0,122,183,.25); }
+
+    /* Inline table data color */
+    .tbl-data { color: #E0D8EC; }
+    .tbl-label { color: #B0A0C0; }
+
+    /* Code spans */
+    code { color: #0CC0DF; background: rgba(12,192,223,.1); padding: 2px 6px; border-radius: 4px; font-family: monospace; }
+  </style>
+</head>
+<body class="bg-bg-dark text-white font-sans min-h-screen">
+  <!-- CSRF token stored in meta tag; JS reads it and sends as X-CSRF-Token header on all POST requests. -->
+  <meta name="csrf-token" content="{{ csrf_token }}">
+
+  <!-- ===== NAVBAR ===== -->
+  <nav style="background:linear-gradient(90deg,#2A0E4A,#4D148C);border-bottom:2px solid #FF6200;" class="px-4 py-2 flex items-center justify-between">
+    <span class="font-bold tracking-tight text-white text-lg flex items-center gap-2">
+      <!-- HDD rack icon -->
+      <svg class="w-5 h-5" style="color:#FF6200" fill="currentColor" viewBox="0 0 20 20"><path d="M2 5a2 2 0 012-2h12a2 2 0 012 2v2a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm0 6a2 2 0 012-2h12a2 2 0 012 2v2a2 2 0 01-2 2H4a2 2 0 01-2-2v-2z"/></svg>
+      Console Gateway
+      <span style="font-size:.65em;font-weight:400;color:#825BAF;vertical-align:middle;">v2.9</span>
+    </span>
+    <div class="flex items-center gap-4">
+      <span class="text-text-muted-c text-sm" id="sys-time"></span>
+      <span class="text-text-muted-c text-sm" id="sys-host"></span>
+      <a href="/logout" class="flex items-center gap-1 text-sm border border-border-s text-text-muted-c rounded px-3 py-1 hover:bg-primary/50 hover:text-white hover:border-highlight transition-colors">
+        <!-- Logout icon -->
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+        Logout
+      </a>
+    </div>
+  </nav>
+
+  <div class="p-3">
+    <!-- ===== STATUS CARDS ===== -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+      <div class="bg-bg-card border border-border-c rounded-xl p-3">
+        <div class="text-text-label text-xs uppercase tracking-wider mb-1">Ports</div>
+        <div class="text-xl font-semibold text-white" id="stat-total">-</div>
+      </div>
+      <div class="bg-bg-card border border-border-c rounded-xl p-3">
+        <div class="text-text-label text-xs uppercase tracking-wider mb-1">Running</div>
+        <div class="text-xl font-semibold" style="color:#008A00" id="stat-running">-</div>
+      </div>
+      <div class="bg-bg-card border border-border-c rounded-xl p-3">
+        <div class="text-text-label text-xs uppercase tracking-wider mb-1">SSH</div>
+        <div class="text-xl font-semibold text-white flex items-center" id="stat-ssh">-</div>
+      </div>
+      <div class="bg-bg-card border border-border-c rounded-xl p-3">
+        <div class="text-text-label text-xs uppercase tracking-wider mb-1">Tailscale</div>
+        <div class="text-xl font-semibold text-white flex items-center" id="stat-tailscale">-</div>
+      </div>
+    </div>
+
+    <!-- ===== TAB NAV ===== -->
+    <div class="flex gap-0 border-b mb-3" style="border-color:rgba(77,20,140,0.45)" id="mainTabs">
+      <button class="tab-btn px-4 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 border-transparent transition-colors" data-tab="tab-ports" onclick="switchTab('tab-ports', this)">
+        <!-- List icon -->
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
+        Ports
+      </button>
+      <button class="tab-btn px-4 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 border-transparent transition-colors" data-tab="tab-terminal" onclick="switchTab('tab-terminal', this)">
+        <!-- Terminal icon -->
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+        Terminal
+      </button>
+      <button class="tab-btn px-4 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 border-transparent transition-colors" data-tab="tab-network" onclick="switchTab('tab-network', this)">
+        <!-- Phone icon -->
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
+        Network
+      </button>
+      <button class="tab-btn px-4 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 border-transparent transition-colors" data-tab="tab-tailscale" onclick="switchTab('tab-tailscale', this)">
+        <!-- Globe icon -->
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        Tailscale
+      </button>
+      <button class="tab-btn px-4 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 border-transparent transition-colors" data-tab="tab-logs" onclick="switchTab('tab-logs', this)">
+        <!-- Document text icon -->
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+        Session Log
+      </button>
+      <button class="tab-btn px-4 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 border-transparent transition-colors" data-tab="tab-settings" onclick="switchTab('tab-settings', this)">
+        <!-- Cog icon -->
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3"/></svg>
+        Settings
+      </button>
+    </div>
+
+    <!-- ===== TAB CONTENT ===== -->
+    <div id="tab-content-wrapper">
+
+      <!-- ── PORTS TAB ── -->
+      <div class="tab-pane active" id="tab-ports">
+        <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+          <div class="flex items-center justify-between px-4 py-2.5 border-b border-border-c bg-primary/30">
+            <span class="font-semibold text-white flex items-center gap-1.5">
+              <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z"/></svg>
+              Port Map
+            </span>
+            <button class="flex items-center gap-1 text-sm border border-border-s text-text-muted-c rounded px-3 py-1 hover:bg-primary/50 hover:text-white transition-colors" onclick="refreshPorts()">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+              Refresh
+            </button>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b border-border-c">
+                  <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Device</th>
+                  <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Port</th>
+                  <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Baud</th>
+                  <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Alias</th>
+                  <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Status</th>
+                  <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Link</th>
+                  <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Owner</th>
+                  <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="ports-table" class="divide-y divide-border-c"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── TERMINAL TAB ── -->
+      <div class="tab-pane" id="tab-terminal">
+        <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+          <div class="flex items-center justify-between px-4 py-2.5 border-b border-border-c bg-primary/30">
+            <span class="font-semibold text-white flex items-center gap-1.5">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+              Web Terminal
+            </span>
+            <div class="flex items-center gap-2">
+              <select id="term-port-select" class="dark-input">
+                <option value="">-- Select Port --</option>
+              </select>
+              <button id="btn-connect" onclick="connectTerminal()" class="flex items-center gap-1 text-sm border border-border-s text-text-muted-c rounded px-3 py-1 hover:bg-primary/50 hover:text-white transition-colors">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                Connect
+              </button>
+              <button id="btn-disconnect" onclick="disconnectTerminal()" style="display:none" class="flex items-center gap-1 text-sm border rounded px-3 py-1 transition-colors" style="border-color:#DE002E;color:#ff6b85;hover:background:#DE002E;hover:color:white;">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                Disconnect
+              </button>
+            </div>
+          </div>
+          <div class="p-2">
+            <div id="terminal-container"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── NETWORK TAB ── -->
+      <div class="tab-pane" id="tab-network">
+        <!-- Mode Banner -->
+        <div class="bg-bg-card border border-border-c rounded-xl mb-3" id="net-mode-card">
+          <div class="flex items-center justify-between px-4 py-2.5">
+            <div>
+              <span class="font-semibold text-white" id="net-mode-label">Normal Mode</span>
+              <span class="text-text-muted-c text-sm ml-2" id="net-mode-detail"></span>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-sm" id="net-iphone-detect"></span>
+              <button onclick="refreshNetwork()" class="p-1.5 border border-border-s text-text-muted-c rounded hover:bg-primary/50 hover:text-white transition-colors">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <!-- Left: Interfaces + Routing -->
+          <div class="space-y-3">
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+              <div class="px-4 py-2.5 border-b border-border-c bg-primary/30 font-semibold text-white flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2"/></svg>
+                Interfaces
+              </div>
+              <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="border-b border-border-c">
+                      <th class="px-3 py-2 w-6"></th>
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Interface</th>
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">IP Address</th>
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">State</th>
+                    </tr>
+                  </thead>
+                  <tbody id="net-ifaces" class="divide-y divide-border-c"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+              <div class="px-4 py-2.5 border-b border-border-c bg-primary/30 font-semibold text-white flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg>
+                Default Route
+              </div>
+              <div class="px-4 py-2.5">
+                <code id="net-default-route" class="text-sm">-</code>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: iPhone Gateway -->
+          <div>
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+              <div class="px-4 py-2.5 border-b border-border-c bg-primary/30 font-semibold text-white flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
+                iPhone USB Gateway
+              </div>
+              <div class="p-4">
+                <!-- Not installed warning -->
+                <div id="net-gw-not-installed" style="display:none">
+                  <p class="text-text-muted-c text-sm mb-2 flex items-center gap-1">
+                    <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                    iPhone gateway scripts not installed. Auto-detection disabled.
+                  </p>
+                  <p class="text-text-muted-c text-sm mb-0">The installer will set up udev rules for auto plug/unplug detection.</p>
+                </div>
+                <!-- Gateway status (when installed) -->
+                <div id="net-gw-status" style="display:none">
+                  <table class="w-full text-sm mb-3">
+                    <tbody class="divide-y divide-border-c">
+                      <tr><td class="py-1.5 tbl-label" style="width:120px">iPhone</td><td class="py-1.5 tbl-data" id="net-gw-detected">-</td></tr>
+                      <tr><td class="py-1.5 tbl-label">Paired</td><td class="py-1.5 tbl-data" id="net-gw-paired">-</td></tr>
+                      <tr id="net-gw-wan-row" style="display:none"><td class="py-1.5 tbl-label">WAN</td><td class="py-1.5 tbl-data" id="net-gw-wan">-</td></tr>
+                      <tr id="net-gw-wanip-row" style="display:none"><td class="py-1.5 tbl-label">WAN IP</td><td class="py-1.5 tbl-data" id="net-gw-wanip">-</td></tr>
+                      <tr id="net-gw-lanip-row" style="display:none"><td class="py-1.5 tbl-label">LAN (eth0)</td><td class="py-1.5 tbl-data" id="net-gw-lanip">-</td></tr>
+                      <tr id="net-gw-traffic-row" style="display:none"><td class="py-1.5 tbl-label">Traffic</td><td class="py-1.5 tbl-data" id="net-gw-traffic">-</td></tr>
+                    </tbody>
+                  </table>
+                  <div class="flex flex-wrap gap-2 mt-3">
+                    <button id="btn-gw-pair" onclick="iphonePair()" class="flex items-center gap-1 text-sm bg-primary text-white rounded px-3 py-1.5 hover:bg-highlight transition-colors">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>
+                      Pair
+                    </button>
+                    <button id="btn-gw-enable" onclick="iphoneGwEnable()" style="display:none" class="flex items-center gap-1 text-sm border border-border-s text-text-muted-c rounded px-3 py-1.5 hover:bg-primary/50 hover:text-white transition-colors">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                      Enable Gateway
+                    </button>
+                    <button id="btn-gw-disable" onclick="iphoneGwDisable()" style="display:none" class="flex items-center gap-1 text-sm border rounded px-3 py-1.5 transition-colors" style="border-color:#DE002E;color:#ff6b85;">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0zM9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"/></svg>
+                      Disable Gateway
+                    </button>
+                  </div>
+                  <div id="net-gw-msg" class="text-sm mt-2" style="display:none"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── TAILSCALE TAB ── -->
+      <div class="tab-pane" id="tab-tailscale">
+        <div class="grid grid-cols-1 md:grid-cols-12 gap-3 mb-3">
+          <!-- This Node -->
+          <div class="md:col-span-5">
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+              <div class="flex items-center justify-between px-4 py-2.5 border-b border-border-c bg-primary/30">
+                <span class="font-semibold text-white flex items-center gap-1.5">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+                  This Node
+                </span>
+                <div class="flex gap-2">
+                  <button onclick="refreshTailscale()" class="p-1.5 border border-border-s text-text-muted-c rounded hover:bg-primary/50 hover:text-white transition-colors">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                  </button>
+                </div>
+              </div>
+              <div class="p-4">
+                <div id="ts-not-running" style="display:none">
+                  <div class="text-center py-3">
+                    <svg class="w-8 h-8 mx-auto mb-2" style="color:#F7B118" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+                    <p class="mt-2 mb-3" id="ts-not-running-msg">Tailscale is not connected</p>
+                    <button onclick="tailscaleUp()" class="flex items-center gap-1 text-sm bg-primary text-white rounded px-3 py-1.5 hover:bg-highlight transition-colors mx-auto">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                      Connect
+                    </button>
+                  </div>
+                </div>
+                <div id="ts-auth-needed" style="display:none">
+                  <div class="text-center py-3">
+                    <svg class="w-8 h-8 mx-auto mb-2" style="color:#F7B118" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
+                    <p class="mt-2">Authentication required</p>
+                    <div id="ts-auth-qr" class="my-3 flex justify-center"></div>
+                    <p class="text-sm text-text-muted-c">Scan QR code with your phone, or click below:</p>
+                    <a id="ts-auth-url" href="#" target="_blank" class="inline-flex items-center gap-1 text-sm bg-primary text-white rounded px-3 py-1.5 hover:bg-highlight transition-colors mb-2">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                      Open Auth Page
+                    </a>
+                    <p class="text-sm text-text-muted-c mt-2">After authenticating, click Refresh</p>
+                  </div>
+                </div>
+                <div id="ts-connected" style="display:none">
+                  <table class="w-full text-sm">
+                    <tbody class="divide-y divide-border-c">
+                      <tr><td class="py-1.5 tbl-label" style="width:120px">Status</td><td class="py-1.5"><span class="badge-running" id="ts-state">-</span></td></tr>
+                      <tr><td class="py-1.5 tbl-label">Hostname</td><td class="py-1.5 tbl-data" id="ts-hostname">-</td></tr>
+                      <tr><td class="py-1.5 tbl-label">Tailscale IP</td><td class="py-1.5"><code id="ts-ip">-</code></td></tr>
+                      <tr><td class="py-1.5 tbl-label">DNS Name</td><td class="py-1.5 tbl-data text-sm" id="ts-dns">-</td></tr>
+                      <tr><td class="py-1.5 tbl-label">Tailnet</td><td class="py-1.5 tbl-data text-sm" id="ts-tailnet">-</td></tr>
+                      <tr><td class="py-1.5 tbl-label">OS</td><td class="py-1.5 tbl-data" id="ts-os">-</td></tr>
+                    </tbody>
+                  </table>
+                  <div class="mt-3 flex gap-2">
+                    <button onclick="tailscaleDown()" class="flex items-center gap-1 text-sm border rounded px-3 py-1.5 transition-colors" style="border-color:#DE002E;color:#ff6b85;">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                      Disconnect
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Peers -->
+          <div class="md:col-span-7">
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+              <div class="px-4 py-2.5 border-b border-border-c bg-primary/30 font-semibold text-white flex items-center gap-2">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+                Peers
+                <span class="ml-1 bg-gray-600 text-white text-xs rounded-full px-2 py-0.5" id="ts-peer-count">0</span>
+              </div>
+              <div>
+                <div id="ts-peers-empty" class="text-center text-text-muted-c py-8">No peers</div>
+                <div class="overflow-x-auto">
+                  <table class="w-full text-sm" id="ts-peers-table" style="display:none">
+                    <thead>
+                      <tr class="border-b border-border-c">
+                        <th class="px-3 py-2 w-6"></th>
+                        <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Hostname</th>
+                        <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">IP</th>
+                        <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">OS</th>
+                        <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Status</th>
+                        <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="ts-peers-body" class="divide-y divide-border-c"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Ping result -->
+        <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden" id="ts-ping-card" style="display:none">
+          <div class="px-4 py-2.5 border-b border-border-c bg-primary/30 font-semibold text-white flex items-center gap-1.5">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+            Ping Result
+          </div>
+          <div class="p-4">
+            <pre id="ts-ping-output" style="color:#c5c8ca;background:#111a24;padding:12px;border-radius:6px;margin:0;white-space:pre-wrap;font-size:.85rem;"></pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── LOGS TAB ── -->
+      <div class="tab-pane" id="tab-logs">
+        <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+          <div class="flex items-center justify-between px-4 py-2.5 border-b border-border-c bg-primary/30">
+            <span class="font-semibold text-white flex items-center gap-1.5">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+              Session Log
+            </span>
+            <button onclick="refreshLogs()" class="flex items-center gap-1 text-sm border border-border-s text-text-muted-c rounded px-3 py-1 hover:bg-primary/50 hover:text-white transition-colors">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+              Refresh
+            </button>
+          </div>
+          <div class="p-4">
+            <div id="session-log"><span class="text-text-muted-c">Loading...</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── SETTINGS TAB ── -->
+      <div class="tab-pane" id="tab-settings">
+        <div class="grid grid-cols-1 md:grid-cols-12 gap-3">
+          <!-- Per-Port Settings (8 cols) -->
+          <div class="md:col-span-8">
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden mb-3">
+              <div class="flex items-center justify-between px-4 py-2.5 border-b border-border-c bg-primary/30">
+                <span class="font-semibold text-white flex items-center gap-1.5">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/></svg>
+                  Port Settings
+                </span>
+                <button onclick="refreshSettings()" class="p-1.5 border border-border-s text-text-muted-c rounded hover:bg-primary/50 hover:text-white transition-colors">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                </button>
+              </div>
+              <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                  <thead>
+                    <tr class="border-b border-border-c">
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Device</th>
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Alias</th>
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">TCP Port</th>
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Baud Rate</th>
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Idle Timeout (s)</th>
+                      <th class="px-3 py-2 text-left text-text-label text-xs uppercase tracking-wider font-medium">Max Session (s)</th>
+                      <th class="px-3 py-2"></th>
+                    </tr>
+                  </thead>
+                  <tbody id="settings-ports-table" class="divide-y divide-border-c"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Global & Web Settings (4 cols) -->
+          <div class="md:col-span-4 space-y-3">
+            <!-- Global Defaults -->
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+              <div class="px-4 py-2.5 border-b border-border-c bg-primary/30 font-semibold text-white flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                Global Defaults
+              </div>
+              <div class="p-4 space-y-3">
+                <div>
+                  <label class="block text-xs text-text-muted-c mb-1">Default Baud Rate</label>
+                  <select id="set-global-baud" class="dark-input w-full">
+                    <option value="9600">9600</option>
+                    <option value="19200">19200</option>
+                    <option value="38400">38400</option>
+                    <option value="57600">57600</option>
+                    <option value="115200">115200</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-xs text-text-muted-c mb-1">Default Idle Timeout (s)</label>
+                  <input type="number" id="set-global-idle" class="dark-input w-full" min="30" max="86400">
+                </div>
+                <div>
+                  <label class="block text-xs text-text-muted-c mb-1">Default Max Session (s)</label>
+                  <input type="number" id="set-global-maxs" class="dark-input w-full" min="60" max="604800">
+                </div>
+                <button onclick="saveGlobalSettings()" class="w-full text-sm bg-primary text-white rounded px-3 py-1.5 hover:bg-highlight transition-colors">Save Defaults</button>
+                <small class="text-text-muted-c block text-xs">Affects all ports not overridden by per-port drop-in</small>
+                <div id="global-save-msg" class="text-sm mt-1" style="display:none"></div>
+              </div>
+            </div>
+
+            <!-- Web Service -->
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+              <div class="px-4 py-2.5 border-b border-border-c bg-primary/30 font-semibold text-white flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+                Web Service
+              </div>
+              <div class="p-4">
+                <table class="w-full text-sm">
+                  <tbody class="divide-y divide-border-c">
+                    <tr><td class="py-1.5 tbl-label">Listen</td><td class="py-1.5 tbl-data" id="set-web-host">-</td></tr>
+                    <tr><td class="py-1.5 tbl-label">Port</td><td class="py-1.5 tbl-data" id="set-web-port">-</td></tr>
+                    <tr><td class="py-1.5 tbl-label">Admin User</td><td class="py-1.5 tbl-data" id="set-web-user">-</td></tr>
+                  </tbody>
+                </table>
+                <small class="text-text-muted-c block mt-2 text-xs">Edit via: sudo systemctl edit console-gateway-web</small>
+              </div>
+            </div>
+
+            <!-- SSH -->
+            <div class="bg-bg-card border border-border-c rounded-xl overflow-hidden">
+              <div class="px-4 py-2.5 border-b border-border-c bg-primary/30 font-semibold text-white flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                SSH
+              </div>
+              <div class="p-4">
+                <table class="w-full text-sm">
+                  <tbody>
+                    <tr><td class="py-1.5 tbl-label">AllowUsers</td><td class="py-1.5 tbl-data" id="set-ssh-users">-</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- end tab-content-wrapper -->
+  </div>
+
+  <!-- ===== RENAME MODAL ===== -->
+  <!-- Backdrop -->
+  <div id="renameModal-backdrop" onclick="hideRenameModal()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;"></div>
+  <!-- Modal -->
+  <div id="renameModal" tabindex="-1" style="display:none;position:fixed;inset:0;z-index:1001;pointer-events:none;">
+    <div style="pointer-events:auto;background:#2A1148;border:1px solid #4D148C;border-radius:12px;width:100%;max-width:440px;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;">
+      <!-- Modal header -->
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid rgba(77,20,140,0.45);">
+        <h6 style="margin:0;font-size:1rem;font-weight:600;display:flex;align-items:center;gap:6px;">
+          <svg style="width:16px;height:16px;color:#FF6200" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+          Edit Alias
+        </h6>
+        <button onclick="hideRenameModal()" style="background:none;border:none;color:#B0A0C0;cursor:pointer;font-size:1.2rem;line-height:1;padding:2px 6px;">&times;</button>
+      </div>
+      <!-- Modal body -->
+      <div style="padding:16px;">
+        <p style="font-size:.85rem;color:#B0A0C0;margin-bottom:8px;">Device: <code id="rename-old"></code></p>
+        <label style="font-size:.85rem;color:#B0A0C0;display:block;margin-bottom:4px;">Alias</label>
+        <input type="text" id="rename-input" class="dark-input" style="width:100%;box-sizing:border-box;" placeholder="e.g. SW-CORE-01" maxlength="60" pattern="[a-zA-Z0-9][a-zA-Z0-9_-]*">
+        <small style="color:#B0A0C0;font-size:.8rem;">Letters, digits, hyphens, underscores. Max 60 chars.</small>
+        <div id="rename-error" style="display:none;color:#DE002E;font-size:.85rem;margin-top:6px;"></div>
+      </div>
+      <!-- Modal footer -->
+      <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid rgba(77,20,140,0.45);">
+        <button onclick="hideRenameModal()" style="font-size:.85rem;border:1px solid #4D148C;color:#B0A0C0;background:none;border-radius:6px;padding:4px 14px;cursor:pointer;">Cancel</button>
+        <button onclick="submitRename()" id="rename-submit-btn" style="font-size:.85rem;background:#4D148C;color:#fff;border:none;border-radius:6px;padding:4px 14px;cursor:pointer;">Rename</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== SCRIPTS ===== -->
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+  <script>
+    // FIX: read CSRF token from meta tag once; include it in all POST requests.
+    const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]').content;
+
+    // ---- State ----
+    let term = null;
+    let socket = null;
+    let connected = false;
+
+    // ---- Tab switching (vanilla JS, replaces Bootstrap Tab) ----
+    const TAB_CALLBACKS = {};
+
+    function switchTab(tabId, btnEl) {
+      // Hide all panes
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      // Deactivate all tab buttons
+      document.querySelectorAll('.tab-btn').forEach(b => {
+        b.style.color = '#B0A0C0';
+        b.style.borderBottomColor = 'transparent';
+      });
+      // Show target pane
+      document.getElementById(tabId).classList.add('active');
+      // Activate clicked button
+      if (btnEl) {
+        btnEl.style.color = '#FF6200';
+        btnEl.style.borderBottomColor = '#FF6200';
+      }
+      // Fire registered callbacks
+      if (TAB_CALLBACKS[tabId]) {
+        TAB_CALLBACKS[tabId].forEach(fn => fn());
+      }
+    }
+
+    // Initialise first tab styling on load
+    (function() {
+      const firstBtn = document.querySelector('.tab-btn');
+      if (firstBtn) {
+        firstBtn.style.color = '#FF6200';
+        firstBtn.style.borderBottomColor = '#FF6200';
+      }
+    })();
+
+    // ---- Modal helpers (vanilla JS, replaces Bootstrap Modal) ----
+    function showRenameModal() {
+      document.getElementById('renameModal-backdrop').style.display = '';
+      document.getElementById('renameModal').style.display = '';
+    }
+    function hideRenameModal() {
+      document.getElementById('renameModal-backdrop').style.display = 'none';
+      document.getElementById('renameModal').style.display = 'none';
+    }
+    // Close on Escape
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') hideRenameModal();
+    });
+
+    // ---- API helpers ----
+    async function api(url, method = 'GET', body = null) {
+      const opts = { method, headers: { 'X-Requested-With': 'XMLHttpRequest' } };
+      if (method === 'POST') {
+        opts.headers['X-CSRF-Token'] = CSRF_TOKEN;
+      }
+      if (body) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
+      const r = await fetch(url, opts);
+      if (r.status === 401) { window.location = '/login'; return null; }
+      return r.json();
+    }
+
+    // ---- Dashboard ----
+    async function refreshStatus() {
+      const s = await api('/api/status');
+      if (!s) return;
+      document.getElementById('sys-time').textContent = s.time;
+      document.getElementById('sys-host').textContent = s.hostname;
+      document.getElementById('stat-ssh').innerHTML = statusHtml(s.ssh);
+      const tsText = s.tailscale === 'ok' ? (s.tailscale_ip || 'OK') : 'Not Connected';
+      document.getElementById('stat-tailscale').innerHTML =
+        `<span class="status-dot ${s.tailscale === 'ok' ? 'ok' : 'down'}"></span>${tsText}`;
+    }
+
+    function statusHtml(s) {
+      return `<span class="status-dot ${s === 'ok' ? 'ok' : 'down'}"></span>${s === 'ok' ? 'OK' : 'Down'}`;
+    }
+
+    async function refreshPorts() {
+      const ports = await api('/api/ports');
+      if (!ports) return;
+      const tbody = document.getElementById('ports-table');
+      const sel = document.getElementById('term-port-select');
+      const curVal = sel.value;
+      tbody.innerHTML = '';
+      sel.innerHTML = '<option value="">-- Select Port --</option>';
+
+      let total = 0, running = 0;
+      ports.forEach(p => {
+        total++;
+        if (p.status === 'running' || p.status === 'busy') running++;
+
+        const badgeClass = `badge-${p.status}`;
+        const actions = buildActions(p);
+
+        tbody.innerHTML += `
+          <tr class="hover:bg-primary/10 transition-colors">
+            <td class="px-3 py-2 tbl-data"><code>${p.device}</code></td>
+            <td class="px-3 py-2 tbl-data">${p.port}</td>
+            <td class="px-3 py-2 tbl-data">${p.baud}</td>
+            <td class="px-3 py-2 tbl-data">${p.alias || '-'}</td>
+            <td class="px-3 py-2"><span class="${badgeClass}">${p.status}</span></td>
+            <td class="px-3 py-2"><small class="tbl-label">${p.link_target || ''}</small></td>
+            <td class="px-3 py-2"><small class="tbl-data">${p.owner || '-'}</small></td>
+            <td class="px-3 py-2">${actions}</td>
+          </tr>`;
+
+        if (p.status === 'running' || p.status === 'busy') {
+          sel.innerHTML += `<option value="${p.port}" ${String(p.port) === curVal ? 'selected' : ''}>${p.alias || p.device} (:${p.port})</option>`;
+        }
+      });
+
+      document.getElementById('stat-total').textContent = total;
+      document.getElementById('stat-running').textContent = running;
+    }
+
+    const BTN_OUTLINE = 'style="font-size:.78rem;border:1px solid #4D148C;color:#B0A0C0;background:none;border-radius:5px;padding:3px 8px;cursor:pointer;margin-right:3px;"';
+    const BTN_DANGER  = 'style="font-size:.78rem;border:1px solid #DE002E;color:#ff6b85;background:none;border-radius:5px;padding:3px 8px;cursor:pointer;margin-right:3px;"';
+
+    function buildActions(p) {
+      // Inline SVG snippets for action buttons
+      const svgEdit    = '<svg style="width:13px;height:13px;display:inline;vertical-align:-2px;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>';
+      const svgRestart = '<svg style="width:13px;height:13px;display:inline;vertical-align:-2px;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>';
+      const svgStop    = '<svg style="width:13px;height:13px;display:inline;vertical-align:-2px;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0zM9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"/></svg>';
+      const svgTerm    = '<svg style="width:13px;height:13px;display:inline;vertical-align:-2px;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>';
+      const svgPlay    = '<svg style="width:13px;height:13px;display:inline;vertical-align:-2px;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>';
+      const svgUnlock  = '<svg style="width:13px;height:13px;display:inline;vertical-align:-2px;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"/></svg>';
+      const svgKick    = '<svg style="width:13px;height:13px;display:inline;vertical-align:-2px;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 7a4 4 0 11-8 0 4 4 0 018 0zM9 14a6 6 0 00-6 6v1h12v-1a6 6 0 00-6-6zM21 12h-6"/></svg>';
+
+      let html = '';
+      html += `<button ${BTN_OUTLINE} onclick="showRename('${p.device}','${p.alias || ''}')" title="Edit Alias">${svgEdit}</button>`;
+      if (p.status === 'running') {
+        html += `<button ${BTN_OUTLINE} onclick="portAction('${p.device}','restart')" title="Restart">${svgRestart}</button>`;
+        html += `<button ${BTN_OUTLINE} onclick="portAction('${p.device}','stop')" title="Stop">${svgStop}</button>`;
+        html += `<button ${BTN_OUTLINE} onclick="openTerminal('${p.port}')" title="Connect">${svgTerm}</button>`;
+      } else if (p.status === 'busy') {
+        html += `<button ${BTN_DANGER} onclick="portAction('${p.device}','unlock')" title="Unlock">${svgUnlock}</button>`;
+        html += `<button ${BTN_OUTLINE} onclick="portAction('${p.device}','kick')" title="Kick & Restart">${svgKick}</button>`;
+        html += `<button ${BTN_OUTLINE} onclick="portAction('${p.device}','restart')" title="Restart">${svgRestart}</button>`;
+      } else if (p.status === 'stopped' || p.status === 'no-device') {
+        html += `<button ${BTN_OUTLINE} onclick="portAction('${p.device}','start')" title="Start">${svgPlay}</button>`;
+      }
+      return html;
+    }
+
+    async function portAction(device, action) {
+      const r = await api(`/api/ports/${device}/${action}`, 'POST');
+      if (r && r.ok) {
+        setTimeout(refreshPorts, 500);
+      } else if (r) {
+        alert(r.error || 'Failed');
+      }
+    }
+
+    // ---- Rename ----
+    let renameDevice = '';
+    function showRename(device, currentAlias) {
+      renameDevice = device;
+      document.getElementById('rename-old').textContent = device;
+      document.getElementById('rename-input').value = currentAlias || '';
+      document.getElementById('rename-error').style.display = 'none';
+      showRenameModal();
+      setTimeout(() => {
+        const input = document.getElementById('rename-input');
+        input.focus();
+        input.select();
+      }, 100);
+    }
+
+    async function submitRename() {
+      const newAlias = document.getElementById('rename-input').value.trim();
+      if (!newAlias || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,59}$/.test(newAlias)) {
+        const err = document.getElementById('rename-error');
+        err.textContent = 'Invalid name. Use letters, digits, hyphens, underscores.';
+        err.style.display = '';
+        return;
+      }
+      const btn = document.getElementById('rename-submit-btn');
+      btn.disabled = true;
+      btn.textContent = 'Renaming...';
+
+      const r = await fetch(`/api/ports/${renameDevice}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': CSRF_TOKEN },
+        body: JSON.stringify({ alias: newAlias }),
+      });
+      const d = await r.json();
+      btn.disabled = false;
+      btn.textContent = 'Rename';
+
+      if (d.ok) {
+        hideRenameModal();
+        setTimeout(refreshPorts, 500);
+      } else {
+        const err = document.getElementById('rename-error');
+        err.textContent = d.error || 'Rename failed';
+        err.style.display = '';
+      }
+    }
+
+    // Submit rename on Enter key
+    document.getElementById('rename-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitRename();
+    });
+
+    // ---- Terminal ----
+    let fitAddon = null;
+
+    function initTerminal() {
+      if (term) return;
+      term = new Terminal({
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+        theme: { background: '#0a0516', foreground: '#E0D8EC', cursor: '#FF6200' },
+      });
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+      window.addEventListener('resize', () => fitAddon.fit());
+    }
+
+    // Register tab callback for terminal refit
+    TAB_CALLBACKS['tab-terminal'] = [() => {
+      if (fitAddon) setTimeout(() => fitAddon.fit(), 50);
+    }];
+
+    function connectTerminal() {
+      const port = document.getElementById('term-port-select').value;
+      if (!port) { alert('Please select a port'); return; }
+      initTerminal();
+      term.clear();
+      term.writeln('Connecting to port ' + port + '...');
+
+      if (socket) { socket.disconnect(); }
+      socket = io('/terminal');
+
+      socket.on('connect', () => {
+        socket.emit('open_terminal', { port: parseInt(port) });
+        connected = true;
+        document.getElementById('btn-connect').style.display = 'none';
+        document.getElementById('btn-disconnect').style.display = '';
+      });
+
+      socket.on('terminal_output', (data) => {
+        term.write(data.data);
+      });
+
+      socket.on('disconnect', () => {
+        connected = false;
+        document.getElementById('btn-connect').style.display = '';
+        document.getElementById('btn-disconnect').style.display = 'none';
+      });
+
+      term.onData((data) => {
+        if (connected) {
+          socket.emit('terminal_input', { data: data });
+        }
+      });
+    }
+
+    function disconnectTerminal() {
+      if (socket) {
+        socket.emit('close_terminal');
+        socket.disconnect();
+        socket = null;
+      }
+      connected = false;
+      document.getElementById('btn-connect').style.display = '';
+      document.getElementById('btn-disconnect').style.display = 'none';
+      if (term) term.writeln('\r\n[disconnected]');
+    }
+
+    function openTerminal(port) {
+      // Switch to terminal tab and connect
+      document.getElementById('term-port-select').value = String(port);
+      const termBtn = document.querySelector('[data-tab="tab-terminal"]');
+      switchTab('tab-terminal', termBtn);
+      setTimeout(connectTerminal, 200);
+    }
+
+    // ---- Logs ----
+    async function refreshLogs() {
+      const lines = await api('/api/sessions');
+      if (!lines) return;
+      const el = document.getElementById('session-log');
+      if (lines.length === 0) {
+        el.innerHTML = '<span class="text-text-muted-c">(no sessions yet)</span>';
+        return;
+      }
+      el.innerHTML = lines.map(l => `<div class="line">${escapeHtml(l)}</div>`).join('');
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    // ---- QR Code helper ----
+    function showAuthQR(url) {
+      const container = document.getElementById('ts-auth-qr');
+      container.innerHTML = '';
+      if (!url) return;
+      const qr = qrcode(0, 'M');
+      qr.addData(url);
+      qr.make();
+      const img = document.createElement('img');
+      img.src = qr.createDataURL(6, 8);
+      img.style.borderRadius = '8px';
+      img.style.border = '4px solid #fff';
+      container.appendChild(img);
+    }
+
+    // ---- Tailscale ----
+    async function refreshTailscale() {
+      const d = await api('/api/tailscale/status');
+      if (!d) return;
+
+      const notRunning = document.getElementById('ts-not-running');
+      const authNeeded = document.getElementById('ts-auth-needed');
+      const connected = document.getElementById('ts-connected');
+      const peersEmpty = document.getElementById('ts-peers-empty');
+      const peersTable = document.getElementById('ts-peers-table');
+
+      notRunning.style.display = 'none';
+      authNeeded.style.display = 'none';
+      connected.style.display = 'none';
+
+      if (!d.daemon_running) {
+        notRunning.style.display = '';
+        document.getElementById('ts-not-running-msg').textContent = 'Tailscale daemon is not running';
+        peersEmpty.style.display = '';
+        peersTable.style.display = 'none';
+        return;
+      }
+
+      if (d.state === 'NeedsLogin' || d.state === 'needs_login') {
+        if (d.auth_url) {
+          authNeeded.style.display = '';
+          const link = document.getElementById('ts-auth-url');
+          link.href = d.auth_url;
+          showAuthQR(d.auth_url);
+        } else {
+          notRunning.style.display = '';
+          document.getElementById('ts-not-running-msg').textContent = 'Tailscale needs login';
+        }
+        peersEmpty.style.display = '';
+        peersTable.style.display = 'none';
+        return;
+      }
+
+      if (d.state === 'Running' && d.self) {
+        connected.style.display = '';
+        document.getElementById('ts-state').textContent = d.state;
+        document.getElementById('ts-hostname').textContent = d.self.hostname;
+        document.getElementById('ts-ip').textContent = (d.self.ips || []).join(', ') || '-';
+        document.getElementById('ts-dns').textContent = d.self.dns_name || '-';
+        document.getElementById('ts-tailnet').textContent = d.self.tailnet || '-';
+        document.getElementById('ts-os').textContent = d.self.os || '-';
+
+        // Peers
+        const peers = d.peers || {};
+        const peerList = Object.values(peers);
+        document.getElementById('ts-peer-count').textContent = peerList.length;
+
+        if (peerList.length === 0) {
+          peersEmpty.style.display = '';
+          peersTable.style.display = 'none';
+        } else {
+          peersEmpty.style.display = 'none';
+          peersTable.style.display = '';
+          const tbody = document.getElementById('ts-peers-body');
+          tbody.innerHTML = '';
+
+          const svgPing = '<svg style="width:13px;height:13px;display:inline;vertical-align:-2px;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>';
+
+          peerList.forEach(p => {
+            const online = p.online;
+            const dotClass = online ? 'ok' : 'down';
+            const statusText = online ? 'Online' : 'Offline';
+            const ip = (p.ips || [])[0] || '-';
+            const pingTarget = p.ips && p.ips[0] ? p.ips[0] : p.hostname;
+            tbody.innerHTML += `
+              <tr class="hover:bg-primary/10 transition-colors">
+                <td class="px-3 py-2"><span class="status-dot ${dotClass}"></span></td>
+                <td class="px-3 py-2 tbl-data">${escapeHtml(p.hostname)}<br><small class="tbl-label">${escapeHtml(p.dns_name || '')}</small></td>
+                <td class="px-3 py-2"><code>${escapeHtml(ip)}</code></td>
+                <td class="px-3 py-2 tbl-data">${escapeHtml(p.os)}</td>
+                <td class="px-3 py-2"><small class="tbl-data">${statusText}</small></td>
+                <td class="px-3 py-2">${online ? `<button ${BTN_OUTLINE} onclick="tailscalePing('${escapeHtml(pingTarget)}')" title="Ping">${svgPing}</button>` : ''}</td>
+              </tr>`;
+          });
+        }
+      } else {
+        notRunning.style.display = '';
+        document.getElementById('ts-not-running-msg').textContent = 'Tailscale state: ' + (d.state || 'Unknown');
+        peersEmpty.style.display = '';
+        peersTable.style.display = 'none';
+      }
+    }
+
+    async function tailscaleUp() {
+      const notRunning = document.getElementById('ts-not-running');
+      const authNeeded = document.getElementById('ts-auth-needed');
+      notRunning.style.display = 'none';
+
+      const r = await api('/api/tailscale/up', 'POST');
+      if (!r) return;
+      if (r.needs_auth && r.auth_url) {
+        authNeeded.style.display = '';
+        const link = document.getElementById('ts-auth-url');
+        link.href = r.auth_url;
+        link.textContent = 'Open Auth Page';
+        showAuthQR(r.auth_url);
+      } else {
+        setTimeout(refreshTailscale, 2000);
+      }
+    }
+
+    async function tailscaleDown() {
+      if (!confirm('Disconnect Tailscale?')) return;
+      await api('/api/tailscale/down', 'POST');
+      setTimeout(refreshTailscale, 1000);
+    }
+
+    async function tailscalePing(target) {
+      const card = document.getElementById('ts-ping-card');
+      const output = document.getElementById('ts-ping-output');
+      card.style.display = '';
+      output.textContent = 'Pinging ' + target + '...';
+      const r = await fetch('/api/tailscale/ping', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-CSRF-Token': CSRF_TOKEN },
+        body: JSON.stringify({ target }),
+      });
+      const d = await r.json();
+      output.textContent = d.output || d.error || 'No response';
+    }
+
+    // Register tab callback for Tailscale
+    TAB_CALLBACKS['tab-tailscale'] = [() => refreshTailscale()];
+
+    // ---- Network / iPhone Gateway ----
+    function fmtBytes(b) {
+      if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GB';
+      if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+      if (b >= 1024) return (b / 1024).toFixed(0) + ' KB';
+      return b + ' B';
+    }
+
+    async function refreshNetwork() {
+      const d = await api('/api/network/status');
+      if (!d) return;
+
+      const modeLabel = document.getElementById('net-mode-label');
+      const modeDetail = document.getElementById('net-mode-detail');
+      const modeCard = document.getElementById('net-mode-card');
+      const detectEl = document.getElementById('net-iphone-detect');
+
+      // Mode banner
+      if (d.mode === 'iphone-gw') {
+        modeLabel.innerHTML = '<svg style="width:14px;height:14px;display:inline;vertical-align:-2px;color:#FF6200;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg> iPhone Gateway Mode';
+        modeDetail.textContent = 'WAN: ' + (d.gateway.wan_if || '?') + ' → LAN: eth0 (DHCP Server)';
+        modeCard.style.borderLeft = '4px solid #FF6200';
+      } else {
+        modeLabel.innerHTML = '<svg style="width:14px;height:14px;display:inline;vertical-align:-2px;color:#008A00;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2"/></svg> Normal Mode';
+        modeDetail.textContent = '';
+        modeCard.style.borderLeft = '';
+      }
+
+      // iPhone detection indicator
+      if (d.iphone_detected) {
+        detectEl.innerHTML = '<span class="badge-running">&#128241; iPhone: ' + escapeHtml(d.usb_wan_if) + '</span>';
+      } else {
+        detectEl.innerHTML = '<span class="badge-stopped">No iPhone</span>';
+      }
+
+      // Interfaces table
+      const ifBody = document.getElementById('net-ifaces');
+      ifBody.innerHTML = '';
+      (d.interfaces || []).forEach(iface => {
+        const isUp = iface.operstate === 'up';
+        const dotClass = isUp ? 'ok' : 'down';
+        ifBody.innerHTML += `<tr class="hover:bg-primary/10 transition-colors">
+          <td class="px-3 py-2"><span class="status-dot ${dotClass}"></span></td>
+          <td class="px-3 py-2"><code>${escapeHtml(iface.name)}</code></td>
+          <td class="px-3 py-2">${iface.ip ? '<code>' + escapeHtml(iface.ip) + '</code>' : '<span class="tbl-label">-</span>'}</td>
+          <td class="px-3 py-2"><small class="tbl-label">${escapeHtml(iface.operstate || 'unknown')}</small></td>
+        </tr>`;
+      });
+
+      // Default route
+      document.getElementById('net-default-route').textContent = d.default_route || '(none)';
+
+      // iPhone Gateway section
+      const notInstalled = document.getElementById('net-gw-not-installed');
+      const gwStatus = document.getElementById('net-gw-status');
+
+      if (!d.gw_installed) {
+        notInstalled.style.display = '';
+        gwStatus.style.display = 'none';
+        return;
+      }
+      notInstalled.style.display = 'none';
+      gwStatus.style.display = '';
+
+      // Detected
+      const detectedEl = document.getElementById('net-gw-detected');
+      if (d.iphone_detected) {
+        detectedEl.innerHTML = `<span class="status-dot ok"></span>Detected (<code>${escapeHtml(d.usb_wan_if)}</code>)`;
+      } else {
+        detectedEl.innerHTML = '<span class="status-dot down"></span>Not connected';
+      }
+
+      // Paired
+      const pairedEl = document.getElementById('net-gw-paired');
+      if (d.iphone_paired) {
+        pairedEl.innerHTML = '<span class="badge-running">Yes</span>';
+      } else {
+        pairedEl.innerHTML = '<span class="badge-stopped">No</span>';
+      }
+
+      // Gateway mode details
+      const gwRows = ['wan', 'wanip', 'lanip', 'traffic'];
+      const btnEnable = document.getElementById('btn-gw-enable');
+      const btnDisable = document.getElementById('btn-gw-disable');
+
+      if (d.mode === 'iphone-gw' && d.gateway) {
+        const gw = d.gateway;
+        document.getElementById('net-gw-wan').innerHTML = `<code>${escapeHtml(gw.wan_if || '-')}</code> ${gw.wan_ready ? '<span class="status-dot ok"></span>' : '<span class="status-dot down"></span>'}`;
+        document.getElementById('net-gw-wanip').innerHTML = gw.wan_ip ? `<code style="color:#008A00">${escapeHtml(gw.wan_ip)}</code>` : '<span style="color:#DE002E">No IP</span>';
+        document.getElementById('net-gw-lanip').innerHTML = gw.lan_ip ? `<code>${escapeHtml(gw.lan_ip)}</code> <small class="tbl-label">(DHCP Server)</small>` : '-';
+        document.getElementById('net-gw-traffic').textContent = fmtBytes(gw.rx_bytes || 0) + ' RX / ' + fmtBytes(gw.tx_bytes || 0) + ' TX';
+        gwRows.forEach(r => document.getElementById('net-gw-' + r + '-row').style.display = '');
+        btnEnable.style.display = 'none';
+        btnDisable.style.display = '';
+      } else {
+        gwRows.forEach(r => document.getElementById('net-gw-' + r + '-row').style.display = 'none');
+        btnEnable.style.display = d.iphone_detected ? '' : 'none';
+        btnDisable.style.display = 'none';
+      }
+    }
+
+    function gwMsg(text, cls) {
+      const msg = document.getElementById('net-gw-msg');
+      msg.textContent = text;
+      // Map Bootstrap-style classes to inline colors
+      const colorMap = { 'text-warning': '#F7B118', 'text-success': '#008A00', 'text-danger': '#DE002E' };
+      msg.style.color = colorMap[cls] || '#fff';
+      msg.style.display = '';
+      setTimeout(() => msg.style.display = 'none', 5000);
+    }
+
+    async function iphonePair() {
+      gwMsg('Pairing... Tap "Trust" on your iPhone.', 'text-warning');
+      const r = await api('/api/iphone/pair', 'POST');
+      if (r && r.ok) {
+        gwMsg(r.message || 'Paired!', 'text-success');
+        setTimeout(refreshNetwork, 1500);
+      } else {
+        gwMsg((r && r.error) || 'Pair failed', 'text-danger');
+      }
+    }
+
+    async function iphoneGwEnable() {
+      gwMsg('Activating iPhone gateway mode...', 'text-warning');
+      const r = await api('/api/network/iphone-gw/enable', 'POST');
+      if (r && r.ok) {
+        gwMsg(r.message || 'Activated!', 'text-success');
+        setTimeout(refreshNetwork, 2000);
+      } else {
+        gwMsg((r && r.error) || 'Activation failed', 'text-danger');
+      }
+    }
+
+    async function iphoneGwDisable() {
+      if (!confirm('Disable iPhone gateway and restore eth0?')) return;
+      gwMsg('Deactivating...', 'text-warning');
+      const r = await api('/api/network/iphone-gw/disable', 'POST');
+      if (r && r.ok) {
+        gwMsg(r.message || 'Deactivated!', 'text-success');
+        setTimeout(refreshNetwork, 2000);
+      } else {
+        gwMsg((r && r.error) || 'Deactivation failed', 'text-danger');
+      }
+    }
+
+    // Register tab callback for Network
+    TAB_CALLBACKS['tab-network'] = [() => refreshNetwork()];
+
+    // ---- Settings ----
+    const BAUD_OPTIONS = [9600, 19200, 38400, 57600, 115200];
+
+    async function refreshSettings() {
+      const [ports, global] = await Promise.all([
+        api('/api/settings/ports'),
+        api('/api/settings/global'),
+      ]);
+      if (ports) {
+        const tbody = document.getElementById('settings-ports-table');
+        tbody.innerHTML = '';
+        ports.forEach(p => {
+          const baudOpts = BAUD_OPTIONS.map(b =>
+            `<option value="${b}" ${b === p.baud ? 'selected' : ''}>${b}</option>`
+          ).join('');
+          tbody.innerHTML += `
+            <tr class="hover:bg-primary/10 transition-colors">
+              <td class="px-3 py-2 tbl-data">${escapeHtml(p.device)}</td>
+              <td class="px-3 py-2 tbl-data">${escapeHtml(p.alias || '-')}</td>
+              <td class="px-3 py-2 tbl-data">${p.port}</td>
+              <td class="px-3 py-2"><select class="dark-input" id="sp-baud-${p.device}" style="width:auto">${baudOpts}</select></td>
+              <td class="px-3 py-2"><input type="number" class="dark-input" id="sp-idle-${p.device}" style="width:90px" value="${p.idle_timeout}" min="30" max="86400"></td>
+              <td class="px-3 py-2"><input type="number" class="dark-input" id="sp-maxs-${p.device}" style="width:90px" value="${p.max_session}" min="60" max="604800"></td>
+              <td class="px-3 py-2"><button ${BTN_OUTLINE} onclick="savePortSettings('${escapeHtml(p.device)}')">&#10003;</button></td>
+            </tr>`;
+        });
+      }
+      if (global) {
+        const c = global.console || {};
+        const w = global.web || {};
+        const s = global.ssh || {};
+        document.getElementById('set-global-baud').value = c.default_baud || 9600;
+        document.getElementById('set-global-idle').value = c.idle_timeout || 900;
+        document.getElementById('set-global-maxs').value = c.max_session || 3600;
+        document.getElementById('set-web-host').textContent = w.host || '-';
+        document.getElementById('set-web-port').textContent = w.port || '-';
+        document.getElementById('set-web-user').textContent = w.admin_user || '-';
+        document.getElementById('set-ssh-users').textContent = s.allow_users || '-';
+      }
+    }
+
+    async function savePortSettings(device) {
+      const baud = parseInt(document.getElementById('sp-baud-' + device).value);
+      const idle = parseInt(document.getElementById('sp-idle-' + device).value);
+      const maxs = parseInt(document.getElementById('sp-maxs-' + device).value);
+      const r = await api('/api/settings/ports/' + device, 'POST', { baud, idle_timeout: idle, max_session: maxs });
+      if (r && r.ok) {
+        showToast('Settings saved for ' + device);
+      } else if (r) {
+        showToast('Error: ' + (r.error || 'save failed'), true);
+      }
+    }
+
+    async function saveGlobalSettings() {
+      const baud = parseInt(document.getElementById('set-global-baud').value);
+      const idle = parseInt(document.getElementById('set-global-idle').value);
+      const maxs = parseInt(document.getElementById('set-global-maxs').value);
+      const msg = document.getElementById('global-save-msg');
+      const r = await api('/api/settings/global', 'POST', { default_baud: baud, idle_timeout: idle, max_session: maxs });
+      if (r && r.ok) {
+        msg.textContent = 'Saved!';
+        msg.style.color = '#008A00';
+        msg.style.display = '';
+        setTimeout(() => msg.style.display = 'none', 3000);
+      } else {
+        msg.textContent = 'Save failed';
+        msg.style.color = '#DE002E';
+        msg.style.display = '';
+      }
+    }
+
+    function showToast(message, isError = false) {
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:9999;';
+      const color = isError ? '#DE002E' : '#008A00';
+      const icon = isError ? '&#9888;' : '&#10003;';
+      el.innerHTML = `<div style="background:#2A1148;border:1px solid #4D148C;border-radius:8px;padding:10px 16px;color:#fff;font-size:.9rem;display:flex;align-items:center;gap:8px;box-shadow:0 4px 16px rgba(0,0,0,0.4);">
+        <span style="color:${color};font-size:1.1rem;">${icon}</span>
+        ${escapeHtml(message)}
+      </div>`;
+      document.body.appendChild(el);
+      setTimeout(() => el.remove(), 3000);
+    }
+
+    // Register tab callback for Settings
+    TAB_CALLBACKS['tab-settings'] = [() => refreshSettings()];
+
+    // ---- Init ----
+    refreshStatus();
+    refreshPorts();
+    refreshLogs();
+    setInterval(refreshStatus, 15000);
+    setInterval(refreshPorts, 10000);
+  </script>
+</body>
+</html>
