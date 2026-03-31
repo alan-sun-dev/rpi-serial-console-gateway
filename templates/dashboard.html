@@ -220,6 +220,10 @@
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                 Disconnect
               </button>
+              <button onclick="openFullscreenTerminal()" class="flex items-center gap-1 text-sm border border-border-s text-text-muted-c rounded px-3 py-1 hover:bg-primary/50 hover:text-white transition-colors" title="Open in new window">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/></svg>
+                Fullscreen
+              </button>
             </div>
           </div>
           <div class="p-2">
@@ -883,6 +887,12 @@
       const termBtn = document.querySelector('[data-tab="tab-terminal"]');
       switchTab('tab-terminal', termBtn);
       setTimeout(connectTerminal, 200);
+    }
+
+    function openFullscreenTerminal() {
+      const port = document.getElementById('term-port-select').value;
+      if (!port) { alert('Please select a port first'); return; }
+      window.open('/terminal?port=' + port, '_blank');
     }
 
     // ---- Logs ----

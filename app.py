@@ -223,6 +223,24 @@ async def dashboard():
     return await render_template("dashboard.html", csrf_token=session.get("csrf_token", ""))
 
 
+@app.route("/terminal")
+@login_required
+async def terminal_page():
+    port = request.args.get("port", type=int)
+    if not port:
+        return redirect(url_for("dashboard"))
+    allowed = get_allowed_ports()
+    if port not in allowed:
+        return "Port not allowed", 403
+    # Find alias for display
+    alias = ""
+    for p in read_map():
+        if p["port"] == port:
+            alias = p.get("alias", "")
+            break
+    return await render_template("terminal.html", port=port, alias=alias)
+
+
 # --------------- API Routes ---------------
 @app.route("/api/ports")
 @login_required
