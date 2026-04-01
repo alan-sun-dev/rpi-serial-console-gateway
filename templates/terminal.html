@@ -60,7 +60,7 @@
   <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
   <script>
     const PORT = {{ port }};
-    let term, socket, fitAddon, connected = false;
+    let term, socket, fitAddon, connected = false, termDataDisposable = null;
 
     function initTerminal() {
       term = new Terminal({
@@ -100,7 +100,8 @@
         document.getElementById('term-status').className = 'text-brand-red';
       });
 
-      term.onData((data) => {
+      if (termDataDisposable) termDataDisposable.dispose();
+      termDataDisposable = term.onData((data) => {
         if (connected) socket.emit('terminal_input', { data });
       });
     }

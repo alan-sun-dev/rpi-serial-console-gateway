@@ -814,6 +814,7 @@
 
     // ---- Terminal ----
     let fitAddon = null;
+    let termDataDisposable = null;
 
     function initTerminal() {
       if (term) return;
@@ -862,7 +863,8 @@
         document.getElementById('btn-disconnect').style.display = 'none';
       });
 
-      term.onData((data) => {
+      if (termDataDisposable) termDataDisposable.dispose();
+      termDataDisposable = term.onData((data) => {
         if (connected) {
           socket.emit('terminal_input', { data: data });
         }
