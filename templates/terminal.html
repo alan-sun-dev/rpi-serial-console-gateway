@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Terminal — {{ alias or "Port " ~ port }}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary:   '#4D148C',
+            highlight: '#7D22C3',
+            accent:    '#FF6200',
+            'bg-dark': '#1C0B2E',
+            'bg-card': '#2A1148',
+            'brand-green': '#008A00',
+            'brand-red':   '#DE002E',
+            'brand-cyan':  '#0CC0DF',
+            'border-s':    '#4D148C',
+            'text-muted-c':'#B0A0C0',
+          },
+        },
+      },
+    };
+  </script>
+  <link href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" rel="stylesheet">
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+    #terminal-container { width: 100%; height: calc(100vh - 40px); }
+    #terminal-container .xterm { height: 100%; }
+  </style>
+</head>
+<body class="bg-bg-dark text-white">
+  <!-- Thin status bar -->
+  <div class="flex items-center justify-between px-3 h-[40px] bg-bg-card border-b border-border-s text-sm">
+    <div class="flex items-center gap-3">
+      <span class="text-text-muted-c">
+        <svg class="w-4 h-4 inline-block mr-1" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+        <span id="term-title" class="font-semibold text-white">{{ alias or "Port " ~ port }}</span>
+        <span class="text-text-muted-c ml-1">(:{{ port }})</span>
+      </span>
+      <span id="term-status" class="text-text-muted-c">Connecting...</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <button onclick="reconnect()" class="border border-border-s text-text-muted-c rounded px-2 py-0.5 hover:bg-primary/50 hover:text-white transition-colors text-xs">
+        Reconnect
+      </button>
+      <button onclick="window.close()" class="border border-border-s text-text-muted-c rounded px-2 py-0.5 hover:bg-primary/50 hover:text-white transition-colors text-xs">
+        Close
+      </button>
+    </div>
+  </div>
+
+  <div id="terminal-container"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+  <script>
+    const PORT = {{ port }};
+    let term, socket, fitAddon, connected = false, termDataDisposable = null;
+
+    function initTerminal() {
+      term = new Terminal({
+        cursorBlink: true,
+        fontSize: 15,
+        fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+        theme: { background: '#0a0516', foreground: '#E0D8EC', cursor: '#FF6200' },
+      });
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+      window.addEventListener('resize', () => fitAddon.fit());
+    }
+
+    function connect() {
+      if (socket) { socket.disconnect(); }
+      document.getElementById('term-status').textContent = 'Connecting...';
+      document.getElementById('term-status').className = 'text-brand-cyan';
+
+      socket = io('/terminal');
+
+      socket.on('connect', () => {
+        socket.emit('open_terminal', { port: PORT });
+        connected = true;
+        document.getElementById('term-status').textContent = 'Connected';
+        document.getElementById('term-status').className = 'text-brand-green';
+      });
+
+      socket.on('terminal_output', (data) => {
+        term.write(data.data);
+      });
+
+      socket.on('disconnect', () => {
+        connected = false;
+        document.getElementById('term-status').textContent = 'Disconnected';
+        document.getElementById('term-status').className = 'text-brand-red';
+      });
+
+      if (termDataDisposable) termDataDisposable.dispose();
+      termDataDisposable = term.onData((data) => {
+        if (connected) socket.emit('terminal_input', { data });
+      });
+    }
+
+    function reconnect() {
+      if (socket) {
+        socket.emit('close_terminal');
+        socket.disconnect();
+        socket = null;
+      }
+      term.clear();
+      connect();
+    }
+
+    // Keyboard shortcut: Ctrl+Shift+R to reconnect
+    document.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && e.shiftKey && e.key === 'R') {
+        e.preventDefault();
+        reconnect();
+      }
+    });
+
+    initTerminal();
+    connect();
+    // Focus terminal
+    setTimeout(() => term.focus(), 100);
+  </script>
+</body>
+</html>

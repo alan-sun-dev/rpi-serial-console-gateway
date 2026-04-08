@@ -51,6 +51,7 @@ Raspberry Pi 多埠獨佔式 Console 伺服器 — 透過 Tailscale VPN、SSH �
 - **systemd 管理** — 樣板 unit 搭配各裝置獨立的 drop-in 覆寫
 - **一鍵解除安裝** — 乾淨移除所有元件
 - **網頁管理介面** — 可選的瀏覽器管理介面，含 Web Terminal、埠管理、Tailscale 控制、連線日誌
+- **iPhone USB 閘道** — 插入 iPhone USB 作為帶外 (out-of-band) 網路；自動偵測後將 eth0 切換為 DHCP server + NAT，拔除後自動還原
 
 ## 系統需求
 
@@ -376,6 +377,24 @@ sudo ufw status verbose
 /dev/
 ├── cgw-SW-CORE-01 -> ttyUSB0    # 持久化 symlink（udev 管理）
 └── cgw-RTR-WAN-01 -> ttyUSB1    # 持久化 symlink（udev 管理）
+
+/usr/local/sbin/
+├── cgw-iphone-up                  # iPhone 閘道啟動（udev/手動）
+└── cgw-iphone-down                # iPhone 閘道停用（udev/手動）
+
+/etc/udev/rules.d/
+└── 99-cgw-iphone.rules            # 自動偵測 iPhone USB 插拔
+
+/run/
+└── cgw-network.state              # 目前網路模式（normal/iphone-gw）
+
+/opt/console-gateway-web/          #（可選）網頁管理介面
+├── app.py                         # Quart + python-socketio（asyncio）應用程式
+├── venv/                          # Python 虛擬環境
+├── templates/
+│   ├── login.html
+│   └── dashboard.html
+└── uninstall.sh
 ```
 
 ## 與 ConsolePi 的比較
@@ -404,20 +423,21 @@ console-gateway 專為需要**簡單、安全、無衝突** console 伺服器且
 - **Dashboard** — 即時埠狀態（running/stopped/busy）、SSH 與 Tailscale 健康狀態
 - **Web Terminal** — 直接在瀏覽器連線 Serial Console（xterm.js + WebSocket）
 - **埠管理** — Start/Stop/Restart/Kick/Unlock、編輯別名
+- **網路 / iPhone 閘道** — 介面狀態、iPhone USB 自動偵測、閘道模式控制
 - **Tailscale 管理** — 連線/斷線、Peers 列表、Ping、QR Code 手機認證
 - **連線日誌** — 瀏覽連線歷史記錄
+- **設定** — 各埠鮑率/逾時覆寫、全域預設值
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  瀏覽器  http://<pi-ip>:8080                             │
-│  ┌─────┐ ┌──────────┐ ┌───────────┐ ┌─────────────┐    │
-│  │Ports│ │ Terminal  │ │ Tailscale │ │ Session Log │    │
-│  └──┬──┘ └────┬─────┘ └─────┬─────┘ └──────┬──────┘    │
-│     │         │              │              │           │
-│     ▼         ▼              ▼              ▼           │
-│  map.tsv   WebSocket     tailscale      sessions.log   │
-│  systemctl  :200x         CLI            tail          │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  瀏覽器  http://<pi-ip>:8080                                      │
+│  ┌─────┐ ┌──────────┐ ┌─────────┐ ┌───────────┐ ┌────┐ ┌────┐  │
+│  │Ports│ │ Terminal  │ │ Network │ │ Tailscale │ │Logs│ │Cfg │  │
+│  └──┬──┘ └────┬─────┘ └────┬────┘ └─────┬─────┘ └──┬─┘ └──┬─┘  │
+│     ▼         ▼            ▼             ▼          ▼      ▼    │
+│  map.tsv   WebSocket   iphone-gw     tailscale   log   settings │
+│  systemctl  :200x      udev/NAT      CLI         tail  drop-in │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### 安裝網頁介面
@@ -461,10 +481,84 @@ sudo /opt/console-gateway-web/uninstall.sh
 
 ### 技術架構
 
-- **後端：** Python Flask + Flask-SocketIO（eventlet）
+- **後端：** Python Quart + python-socketio（asyncio/ASGI），以 uvicorn 提供服務
 - **前端：** Bootstrap 5 + xterm.js + socket.io + qrcode-generator
-- **認證：** SHA-256 密碼雜湊，session-based 登入
+- **認證：** werkzeug pbkdf2 密碼雜湊，session-based 登入，CSRF token 保護
 - **部署：** Python venv 安裝於 `/opt/console-gateway-web/`，systemd 管理
+
+## iPhone USB 閘道（帶外網路）
+
+在缺乏可靠網路的遠端站點作業時，可透過 USB 連接 iPhone 作為帶外 (out-of-band) 網路上行鏈路。Web 安裝程式會設定**自動插拔偵測** — 無需手動設定。
+
+### 運作原理
+
+```
+iPhone 插入（USB）                     iPhone 拔除
+        │                                    │
+   udev 觸發                             udev 觸發
+        │                                    │
+   cgw-iphone-up                       cgw-iphone-down
+        │                                    │
+   ┌────▼─────────────────────┐      ┌───────▼───────────────┐
+   │ 1. 偵測 usb0/enx*        │      │ 1. 停止 dnsmasq       │
+   │ 2. 備份 eth0 設定         │      │ 2. 移除 NAT 規則      │
+   │ 3. idevicepair pair      │      │ 3. 還原 eth0          │
+   │ 4. eth0 → 192.168.88.1   │      │    （NM / dhcpcd /    │
+   │    DHCP 伺服器啟動        │      │     手動回復）         │
+   │ 5. nftables NAT          │      └───────────────────────┘
+   │    iPhone USB = WAN      │
+   └──────────────────────────┘
+
+   模式：iPhone 閘道                 模式：正常
+   eth0: 192.168.88.1（LAN/DHCP）    eth0: 原始設定
+   usb0: iPhone 熱點（WAN）          usb0:（已移除）
+   eth0 上的其他裝置可上網            Tailscale 透過 eth0/WiFi 重連
+```
+
+### 使用方式
+
+1. **連接 iPhone** 至 Pi（USB 線）
+2. **開啟個人熱點**（設定 > 個人熱點）
+3. **首次使用：** 在 iPhone 上點選「信任這部電腦」
+4. 閘道模式自動啟動 — eth0 變為 DHCP 伺服器（192.168.88.0/24），eth0 上的其他裝置可透過 iPhone 上網
+5. **拔除 iPhone** — eth0 自動恢復先前設定
+
+### 網路模式
+
+| 模式 | WAN（網際網路） | eth0 角色 | 使用情境 |
+|------|----------------|-----------|----------|
+| 正常（DHCP） | eth0 透過站點網路 | DHCP 用戶端 | 站點網路正常 |
+| 正常（WiFi） | wlan0 | DHCP 用戶端或未使用 | 使用 Pi 的 WiFi 上網 |
+| iPhone 閘道 | iPhone USB（usb0） | **DHCP 伺服器**（192.168.88.0/24） | 帶外 / 無站點網路 |
+
+### 網頁介面控制
+
+**Network** 分頁顯示：
+- 目前模式指示（正常 / iPhone 閘道）
+- 所有網路介面及 IP 與連線狀態
+- 預設路由
+- iPhone 偵測與配對狀態
+- 手動 **啟用閘道** / **停用閘道** / **配對 iPhone** 按鈕
+
+### iPhone 閘道疑難排解
+
+```bash
+# 查看目前模式
+cat /run/cgw-network.state
+
+# 監看自動偵測日誌
+journalctl -t cgw-iphone -f
+
+# 手動啟用/停用
+sudo /usr/local/sbin/cgw-iphone-up
+sudo /usr/local/sbin/cgw-iphone-down
+
+# 檢查 iPhone 配對狀態
+idevicepair validate
+
+# 檢查 udev 規則是否已載入
+udevadm info /sys/class/net/usb0    # iPhone 插入時
+```
 
 ## 解除安裝
 

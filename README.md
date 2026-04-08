@@ -324,7 +324,7 @@ sudo ufw status verbose
 └── cgw-network.state              # current network mode (normal/iphone-gw)
 
 /opt/console-gateway-web/          # (optional) web management UI
-├── app.py                         # Flask + SocketIO application
+├── app.py                         # Quart + python-socketio (asyncio) application
 ├── venv/                          # Python virtual environment
 ├── templates/
 │   ├── login.html
@@ -419,7 +419,7 @@ sudo /opt/console-gateway-web/uninstall.sh
 
 ### Web UI Tech Stack
 
-- **Backend:** Python Flask + Flask-SocketIO (eventlet)
+- **Backend:** Python Quart + python-socketio (asyncio/ASGI) served by uvicorn
 - **Frontend:** Bootstrap 5 + xterm.js + socket.io + qrcode-generator
 - **Auth:** werkzeug pbkdf2 password hash, session-based login, CSRF token protection
 - **Install:** Python venv in `/opt/console-gateway-web/`, systemd managed
